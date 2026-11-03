@@ -1,0 +1,119 @@
+name: ${COMPOSE_PROJECT_NAME:-family-assistant}
+
+x-app: &app
+  image: family-assistant:${APP_VERSION:-draft}
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://${POSTGRES_USER:-family}:${POSTGRES_PASSWORD:?Run scripts/generate_env.py}@postgres:5432/${POSTGRES_DB:-family}
+    MEDIA_ROOT: /data/media
+  volumes:
+    - media_data:/data
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: '3'
+
+x-ready: &ready
+  postgres:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-family}
+      POSTGRES_DB: ${POSTGRES_DB:-family}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/generate_env.py}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  migrate:
+    <<: *app
+    command: [sh, -c, 'python manage.py migrate --noinput && python manage.py bootstrap_users']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    <<: *app
+    command: [python, manage.py, runbot]
+    depends_on: *ready
+
+  worker_chat:
+    <<: *app
+    command: [python, manage.py, runworker, --queue, chat]
+    depends_on: *ready
+
+  worker_service:
+    <<: *app
+    command: [python, manage.py, runworker, --queue, service]
+    depends_on: *ready
+
+  worker_notifications:
+    <<: *app
+    command: [python, manage.py, runworker, --queue, notifications]
+    depends_on: *ready
+
+  scheduler:
+    <<: *app
+    command: [python, manage.py, runscheduler]
+    depends_on: *ready
+
+  app:
+    <<: *app
+    profiles: [web]
+    expose: ['8000']
+    depends_on: *ready
+    healthcheck:
+      test: [CMD, python, -c, 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz/", timeout=3)']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [web]
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./scripts/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_started
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+volumes:
+  postgres_data:
+  media_data:
+  caddy_data:
+  caddy_config:

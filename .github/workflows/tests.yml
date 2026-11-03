@@ -1,0 +1,37 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-bookworm
+        env:
+          POSTGRES_USER: family
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: family_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U family -d family_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://family:test-only-password@127.0.0.1:5432/family_test
+      DEBUG: '1'
+      DJANGO_SECRET_KEY: ci-only-not-for-production-change-me-123456789
+      ALLOWED_TELEGRAM_IDS: '1001,1002'
+      TOKEN_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python manage.py check
+      - run: python manage.py makemigrations --check --dry-run
+      - run: pytest -q
+      - run: cp .env.example .env
+      - run: docker compose --env-file .env.example config --quiet
+        env:
+          POSTGRES_PASSWORD: ci-config-only
+      - run: docker build -t family-assistant:ci .
