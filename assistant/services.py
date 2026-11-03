@@ -302,7 +302,9 @@ def make_checklist(user,parent_type,parent_id,text):
 
 @transaction.atomic
 def set_checklist_item(user,item_id,checked):
-    item=ChecklistItem.objects.select_for_update().select_related('checklist__event','checklist__trip').get(pk=item_id)
+    # Lock the item only: optional event/trip relations use LEFT OUTER JOIN,
+    # whose nullable side PostgreSQL cannot lock with an unrestricted FOR UPDATE.
+    item=ChecklistItem.objects.select_for_update(of=('self',)).select_related('checklist__event','checklist__trip').get(pk=item_id)
     parent=item.checklist.parent
     participant=parent.participants.filter(pk=user.pk).exists()
     if not can_view(parent,user) or not (can_edit(parent,user) or item.assignee_id==user.id or (not item.assignee_id and participant)):
