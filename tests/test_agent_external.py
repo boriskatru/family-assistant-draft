@@ -108,6 +108,7 @@ def test_brave_search_uses_key_header_and_returns_real_urls(settings):
 
 
 def test_native_web_search_requires_actual_evidence(settings):
+    settings.LLM_WEB_SEARCH_MAX_OUTPUT_TOKENS=3250
     settings.BRAVE_SEARCH_API_KEY='';settings.LLM_API_KEY='test-model-key';settings.LLM_MODEL='test-model';settings.LLM_BASE_URL='https://api.openai.com/v1'
     unsupported={'output':[{'type':'message','content':[{'type':'output_text','text':'Probably 10–18','annotations':[]}]}]}
     with patch.object(e,'_json_request',return_value=unsupported):
@@ -118,6 +119,7 @@ def test_native_web_search_requires_actual_evidence(settings):
         result=e.search_web('Museum hours')
     assert result['ok'] and result['text']=='10–18' and len(result['sources'])==1
     assert request.call_args.kwargs['json']['tool_choice']=='required'
+    assert request.call_args.kwargs['json']['max_output_tokens']==3250
     assert request.call_args.kwargs['json']['store'] is False
     assert result['usage']['total_tokens']==200
 

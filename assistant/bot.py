@@ -29,6 +29,7 @@ from .models import (
 )
 from .queue import enqueue
 from . import services
+from .chat_memory import read_chat_history, remember_turn
 
 log = logging.getLogger(__name__)
 
@@ -460,6 +461,8 @@ def _agent_history(person,args,shared):
         status=labels.get(run.status,'неизвестное состояние')
         stamp=run.created_at.astimezone(ZoneInfo(person.timezone)).strftime('%d.%m %H:%M')
         lines.append(f'\n{stamp} — {status}; вызовов инструментов: {run.tool_count}')
+        if 'cached_input_tokens' in run.usage:
+            lines.append(f"Входных токенов: {run.usage.get('input_tokens', 0)}, из кэша: {run.usage['cached_input_tokens']}.")
         run_refs=list(run.permission_refs or [])+list((run.final_reply or {}).get('permission_refs') or [])
         readable=True
         for ref in run_refs:
@@ -837,19 +840,10 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
         reply=dispatch_command(person,chat_id,text,shared)
         if reply is None:
             reply=_result('Для свободного текста настройте LLM_API_KEY и LLM_MODEL. Команды доступны через /help.')
-    if person and not callback and (message.get('text') or (prepared or {}).get('text')):
-        user_text=(prepared or {}).get('text') or message.get('text','')
-        conversation,_=Conversation.objects.get_or_create(person=person,chat_id=chat_id)
-        conversation.messages=(conversation.messages+[{'role':'user','content':user_text[:2000]}])[-6:]
-        conversation.save(update_fields=['messages','updated_at'])
+    if person and not callback:
+        user_text = (prepared or {}).get('text') or message.get('text', '')
+        remember_turn(person, chat_id, message.get('message_id'), user_text, reply)
     return reply
-
-
-def _history(person,chat_id,shared):
-    if shared:
-        return []
-    conversation=Conversation.objects.filter(person=person,chat_id=chat_id).first()
-    return conversation.messages if conversation else []
 
 
 async def process_update(payload):
@@ -917,8 +911,11 @@ async def process_update(payload):
                     prepared={'reply':{'text':reply['text'],'permission_refs':reply.get('permission_refs',[])},'text':text}
                 else:
                     from .integrations.llm import interpret
-                    history=await sync_to_async(_history)(person,chat_id,shared)
+                    history, guards = await sync_to_async(read_chat_history)(person, chat_id, shared, message.get('message_id'))
+                    history = [entry for entry in history if entry['role'] == 'user']
                     action=await sync_to_async(interpret,thread_sensitive=False)(person,text,shared_context=shared,history=history)
+                    if guards and not shared:
+                        action['permission_refs'] = [*action.get('permission_refs', []), *guards]
                     prepared={'action':action,'text':text}
             except Exception as exc:
                 log.warning('Language interpretation failed: %s',type(exc).__name__)

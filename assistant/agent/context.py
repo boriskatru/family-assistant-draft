@@ -67,6 +67,29 @@ class AgentContext:
     def autonomy(self):
         return self.person.profile.get('agent_autonomy',settings.AGENT_AUTONOMY)
 
+    def inherit_history(self, messages, refs):
+        """Protect answers and public tool calls derived from a previous turn."""
+        self._egress.observe({'history': messages})
+        if not refs:
+            return
+        # Preserve known sensitive document fields even if an old answer
+        # repeated an unlabelled booking code and the model does not reread it.
+        from assistant.models import Document
+        documents = [ref['id'] for ref in refs if ref['kind'] == 'document']
+        if documents:
+            for metadata in Document.objects.filter(pk__in=documents).values_list('metadata', flat=True):
+                self._egress.observe({'metadata': metadata})
+            for message in messages:
+                if message['role'] == 'assistant':
+                    self._egress.observe({'document_id': 'history', 'text': message['content']})
+        with transaction.atomic():
+            run = AgentRun.objects.select_for_update().get(pk=self.run.pk)
+            if run.status != 'running':
+                raise AgentInterrupted('Обработка уже завершена или прервана.')
+            run.permission_refs = _refs_merge(run.permission_refs, refs)
+            run.save(update_fields=['permission_refs', 'updated_at'])
+            self.run.permission_refs = run.permission_refs
+
     def _reserve(self,external):
         with transaction.atomic():
             run=AgentRun.objects.select_for_update().get(pk=self.run.pk)
@@ -177,7 +200,7 @@ class AgentContext:
         return await sync_to_async(_partial_summary)(self.run)
 
     async def finish(self,status,text):
-        reply={'text':str(text)[:16000],'permission_refs':self.run.permission_refs}
+        reply={'text':str(text),'permission_refs':self.run.permission_refs}
         self.run.status=status
         self.run.final_reply=reply
         self.run.finished_at=timezone.now()

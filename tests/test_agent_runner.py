@@ -212,7 +212,7 @@ def test_private_profile_locations_omitted_from_group_context(people):
     assert 'internal_secret' not in personal['own_profile']
     ctx.shared_context=True
     shared=_input_reference(ctx)
-    assert shared['own_profile']=={} and shared['recent_user_messages']==[]
+    assert shared['own_profile']=={} and 'recent_user_messages' not in shared
 
 
 @pytest.mark.django_db(transaction=True)

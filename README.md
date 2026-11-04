@@ -48,6 +48,8 @@ docker compose logs --tail=80 migrate bot worker_chat worker_service worker_noti
 | Функция | Что настроить |
 |---|---|
 | Многошаговый агент | `LLM_API_KEY`, `LLM_MODEL`, `AGENT_ENABLED=1`; адрес `LLM_BASE_URL` должен поддерживать Responses API и function tools |
+| Память диалога | `AGENT_HISTORY_USER_LIMIT=50` включает текущий запрос и до 49 предыдущих сообщений этого пользователя в том же чате вместе с ответами бота |
+| Кэш модели | `LLM_PROMPT_CACHE_TTL=30m` для поддерживаемых моделей OpenAI, включая GPT-6 Luna и GPT-6.1 Terra. История хранится на VPS, а OpenAI может повторно использовать общую начальную часть запросов |
 | Интернет-поиск | Встроенный web search OpenAI с тем же ключом; для другого поискового провайдера — `BRAVE_SEARCH_API_KEY` |
 | Места и маршруты | `GOOGLE_MAPS_API_KEY`; включить Places API (New) и Routes API, см. [DEPLOY.md](docs/DEPLOY.md) |
 | Голосовые | Дополнительно `LLM_TRANSCRIPTION_MODEL`, поддерживающая audio transcriptions |

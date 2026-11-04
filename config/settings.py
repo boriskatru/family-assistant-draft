@@ -60,20 +60,41 @@ LLM_BASE_URL=os.getenv('LLM_BASE_URL','https://api.openai.com/v1').rstrip('/')
 LLM_TRANSCRIPTION_MODEL=os.getenv('LLM_TRANSCRIPTION_MODEL','')
 LLM_DOCUMENT_MODEL=os.getenv('LLM_DOCUMENT_MODEL','')
 LLM_WEB_SEARCH_MODEL=os.getenv('LLM_WEB_SEARCH_MODEL','')
+LLM_REASONING_EFFORT = os.getenv('LLM_REASONING_EFFORT', '').strip()
+if LLM_REASONING_EFFORT not in ('', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+    raise RuntimeError('Invalid LLM_REASONING_EFFORT. Use a supported reasoning effort or leave it empty.')
+LLM_PROMPT_CACHE_TTL = os.getenv('LLM_PROMPT_CACHE_TTL', '30m').strip()
+if LLM_PROMPT_CACHE_TTL not in ('30m', '12h'):
+    raise RuntimeError('LLM_PROMPT_CACHE_TTL must be 30m or 12h')
 BRAVE_SEARCH_API_KEY=os.getenv('BRAVE_SEARCH_API_KEY','')
 GOOGLE_MAPS_API_KEY=os.getenv('GOOGLE_MAPS_API_KEY','')
 AGENT_ENABLED=os.getenv('AGENT_ENABLED','1')=='1'
 AGENT_AUTONOMY=os.getenv('AGENT_AUTONOMY','personal')
-AGENT_MAX_TURNS=int(os.getenv('AGENT_MAX_TURNS','12'))
-AGENT_MAX_TOOL_CALLS=int(os.getenv('AGENT_MAX_TOOL_CALLS','24'))
-AGENT_MAX_EXTERNAL_CALLS=int(os.getenv('AGENT_MAX_EXTERNAL_CALLS','8'))
-AGENT_TIMEOUT_SECONDS=int(os.getenv('AGENT_TIMEOUT_SECONDS','180'))
-AGENT_MAX_OUTPUT_TOKENS=int(os.getenv('AGENT_MAX_OUTPUT_TOKENS','2000'))
-AGENT_MAX_TOTAL_TOKENS=int(os.getenv('AGENT_MAX_TOTAL_TOKENS','80000'))
 if AGENT_AUTONOMY not in ('personal','read_only'):
     raise RuntimeError('AGENT_AUTONOMY must be personal or read_only')
-if not (1<=AGENT_MAX_TURNS<=30 and 1<=AGENT_MAX_TOOL_CALLS<=100 and 1<=AGENT_MAX_EXTERNAL_CALLS<=30 and 10<=AGENT_TIMEOUT_SECONDS<=600 and 128<=AGENT_MAX_OUTPUT_TOKENS<=8000 and 1000<=AGENT_MAX_TOTAL_TOKENS<=200000):
-    raise RuntimeError('Agent budget settings are outside supported bounds')
+
+
+def _positive_integer(name, default):
+    try:
+        value = int(os.getenv(name, default))
+    except ValueError:
+        raise RuntimeError(f'{name} must be a positive integer') from None
+    if value <= 0:
+        raise RuntimeError(f'{name} must be a positive integer')
+    return value
+
+
+AGENT_MAX_TURNS = _positive_integer('AGENT_MAX_TURNS', 12)
+AGENT_MAX_TOOL_CALLS = _positive_integer('AGENT_MAX_TOOL_CALLS', 24)
+AGENT_MAX_EXTERNAL_CALLS = _positive_integer('AGENT_MAX_EXTERNAL_CALLS', 8)
+AGENT_TIMEOUT_SECONDS = _positive_integer('AGENT_TIMEOUT_SECONDS', 180)
+AGENT_MAX_OUTPUT_TOKENS = _positive_integer('AGENT_MAX_OUTPUT_TOKENS', 2000)
+AGENT_MAX_TOTAL_TOKENS = _positive_integer('AGENT_MAX_TOTAL_TOKENS', 80000)
+LLM_WEB_SEARCH_MAX_OUTPUT_TOKENS = _positive_integer('LLM_WEB_SEARCH_MAX_OUTPUT_TOKENS', 1800)
+LLM_STRUCTURED_MAX_OUTPUT_TOKENS = _positive_integer('LLM_STRUCTURED_MAX_OUTPUT_TOKENS', 4000)
+AGENT_HISTORY_USER_LIMIT = _positive_integer('AGENT_HISTORY_USER_LIMIT', 50)
+if AGENT_HISTORY_USER_LIMIT > 50:
+    raise RuntimeError('AGENT_HISTORY_USER_LIMIT must be between 1 and 50')
 SECURE_PROXY_SSL_HEADER=('HTTP_X_FORWARDED_PROTO','https')
 SECURE_CONTENT_TYPE_NOSNIFF=True
 X_FRAME_OPTIONS='DENY'

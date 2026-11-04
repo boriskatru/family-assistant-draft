@@ -297,7 +297,7 @@ def _post_response(model_setting: str, inputs: list[dict], instructions: str, sc
         'store': False,
         'instructions': instructions,
         'input': inputs,
-        'max_output_tokens': 4000,
+        'max_output_tokens': settings.LLM_STRUCTURED_MAX_OUTPUT_TOKENS,
         'text': {'format': {'type': 'json_schema', 'name': schema_name, 'strict': True, 'schema': schema}},
     }
     try:
@@ -364,8 +364,9 @@ def interpret(user, text: str, shared_context: bool = False, history: list | Non
     # Older assistant answers may contain data whose visibility has changed.
     # Only explicit user-authored history from this private dialog is eligible.
     safe_history = []
-    if not shared_context and isinstance(history, list):
-        for item in history[-6:]:
+    prior_turns = settings.AGENT_HISTORY_USER_LIMIT - 1
+    if prior_turns and not shared_context and isinstance(history, list):
+        for item in history[-prior_turns:]:
             if isinstance(item, dict) and item.get('role') == 'user' and isinstance(item.get('content'), str):
                 safe_history.append(item['content'][:2000])
     if safe_history:

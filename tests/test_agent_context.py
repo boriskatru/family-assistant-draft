@@ -118,3 +118,26 @@ def test_egress_blocks_document_copy_but_permits_map_address(settings):
     guard.observe({'document_id':'doc','text':text})
     with pytest.raises(PermissionDenied):guard.check({'url':'https://example.org/?copy='+text})
     guard.check({'origin':'Москва, Тверская 1','destination':'Шереметьево'})
+
+
+def test_recalled_document_guards_follow_a_new_answer_and_block_external_search(people, settings, tmp_path):
+    from assistant.chat_memory import remember_turn, history_for_agent
+
+    person, spouse = people
+    settings.MEDIA_ROOT = tmp_path
+    doc = services.save_document(spouse, 'ticket.txt', b'original', 'text/plain',
+                                 metadata={'booking_reference': 'ZXCV97'})
+    services.share_entity(spouse, 'document', doc.pk, 'shared')
+    guard = {'kind': 'document', 'id': str(doc.pk)}
+    remember_turn(person, person.chat_id, 100, 'Какой код?', {'text': 'ZXCV97', 'permission_refs': [guard]})
+    ctx = context(person)
+    ctx.inherit_history(*history_for_agent(ctx))
+    remote = Mock(return_value={'ok': True})
+    denied = asyncio.run(ctx.dispatch('search_web', {'query':'ZXCV97'}, remote, external=True))
+    assert not denied['ok']
+    remote.assert_not_called()
+    reply = asyncio.run(ctx.finish('completed', 'Из билета: ZXCV97'))
+    assert reply['permission_refs'] == [guard]
+    remember_turn(person, person.chat_id, 101, 'Повтори', reply)
+    services.share_entity(spouse, 'document', doc.pk, 'private')
+    assert history_for_agent(ctx) == ([], [])

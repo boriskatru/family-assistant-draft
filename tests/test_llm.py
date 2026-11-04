@@ -74,7 +74,7 @@ def test_coerces_ids_and_dates_to_json_safe_values():
     json.dumps(action)
 
 
-@override_settings(LLM_API_KEY='test-key', LLM_MODEL='test-model', LLM_BASE_URL='https://api.openai.com/v1')
+@override_settings(LLM_API_KEY='test-key', LLM_MODEL='test-model', LLM_BASE_URL='https://api.openai.com/v1', LLM_STRUCTURED_MAX_OUTPUT_TOKENS=2100)
 def test_interpret_uses_only_filtered_context_and_never_executes():
     # Module injected only when root's service module is not yet ready in early unit development.
     services = MagicMock()
@@ -86,6 +86,7 @@ def test_interpret_uses_only_filtered_context_and_never_executes():
         services.context_for.assert_called_once_with(SimpleNamespace(timezone='Europe/Moscow'), shared_context=True)
         payload = client.return_value.__enter__.return_value.post.call_args.kwargs['json']
         assert payload['store'] is False
+        assert payload['max_output_tokens'] == 2100
         assert payload['text']['format']['strict'] is True
         assert 'SECRET' not in json.dumps(payload)
         services.execute_action.assert_not_called()
