@@ -30,6 +30,7 @@ from .models import (
 from .queue import enqueue
 from . import services
 from .chat_memory import read_chat_history, remember_turn
+from .telegram_format import render_markdown, render_plain
 
 log = logging.getLogger(__name__)
 
@@ -67,10 +68,11 @@ HELP = """Семейный ассистент · команды
 /sync — синхронизация
 /resolve ID_события local|remote — разрешить конфликт Google
 
-Пришлите PDF/фото — сохраню оригинал. Необязательная подпись:
+Пришлите PDF или фото с подписью — сохраню оригинал и текст. Для привязки укажите в первой строке своей подписи:
 /attach event|trip|task ID
 /repeat — примеры повторений.
-Можно написать обычным текстом при настроенном LLM API: агент сам выбирает необходимые поиски и действия. Режим выполнения — /agent. Совместные события проходят согласование второго участника. Даты команд — в вашем часовом поясе; «shared» означает видимость обоим. Для участия двоих добавьте к /event шестое поле: | 1001,1002 (ваши Telegram ID); к /trip — пятое поле. /call имеет формат /event и создаёт Meet при подключённом Google.
+При подключённом ИИ напишите, например, «Поставь нам с супругой спектакль 13 ноября в 16:00 на два часа». Режим работы показывает /agent. Любой из вас может добавить событие сразу для двоих.
+Даты команд — в вашем часовом поясе. Для события на двоих укажите shared и перечислите оба Telegram ID в шестом поле /event. Для /trip участники указываются в пятом поле. /call имеет формат /event и создаёт Meet при подключённом Google.
 """
 
 SETTINGS_HELP = """Настройки меняются в личном чате:
@@ -118,6 +120,23 @@ def _command(text):
         return '', text
     name, _, args = text.partition(' ')
     return name.split('@', 1)[0].lower(), args.strip()
+
+
+def telegram_attachment_parts(message):
+    """Separate a sender's /attach command line from the original caption."""
+    caption = message.get('caption')
+    if not isinstance(caption, str) or not caption.strip():
+        return None, ''
+    forwarded = any(message.get(field) for field in (
+        'forward_origin', 'forward_date', 'forward_from', 'forward_from_chat',
+        'forward_sender_name', 'forward_from_message_id', 'forward_signature', 'is_automatic_forward',
+    ))
+    if not forwarded:
+        first_line, _, rest = caption.partition('\n')
+        command, args = _command(first_line.rstrip('\r'))
+        if command == '/attach':
+            return args, rest if rest.strip() else ''
+    return None, caption
 
 
 def _time(text):
@@ -274,9 +293,13 @@ def _card(kind, identifier, person, shared=False):
             rows.append([(checklist.title, f'things:{checklist.pk}:0')])
     if kind == 'document':
         lines.append(f'Оригинал: {obj.original_name}; размер: {obj.size} байт')
-        if obj.metadata:
-            review={key:value for key,value in obj.metadata.items() if key not in {'extracted_text'} and value not in (None,'',[])}
-            lines.append('Распознанные сведения требуют проверки:\n'+json.dumps(review,ensure_ascii=False,indent=2)[:2500])
+        if obj.telegram_caption:
+            lines.append('Подпись в Telegram:\n' + obj.telegram_caption)
+        if isinstance(obj.metadata, dict):
+            review = {key: value for key, value in obj.metadata.items()
+                      if key not in {'extracted_text', 'telegram_caption'} and value not in (None, '', [])}
+            if review:
+                lines.append('Распознанные сведения требуют проверки:\n'+json.dumps(review,ensure_ascii=False,indent=2)[:2500])
         rows.append([('Скачать оригинал',f'get:{obj.pk}')])
     if kind == 'task':
         lines.append(f'Статус: {obj.status}; срок: {obj.due_at or "не задан"}')
@@ -441,7 +464,7 @@ def _agent_settings(person,args,shared):
     lines=[f'Агент: {"включён" if enabled else "отключён; используется прежний режим с подтверждением"}.',
            f'Модель: {"подключена в настройках сервера" if connected else "требуется настроить ключ и модель на сервере"}.',
            'Режим: '+('автономное выполнение разрешённых действий.' if mode=='personal' else 'только чтение, поиск и рекомендации.'),
-           'Совместные события требуют согласования второго участника.',
+           'Любой из вас может добавить событие для двоих. Перенос и отмена общей встречи требуют согласия второго участника.',
            'Поиск по расписанию и загруженным документам доступен с учётом ваших прав.',
            '/agent autonomy personal — выполнять действия\n/agent autonomy read_only — только читать\n/agent_history — последние запуски']
     return _result('\n'.join(lines))
@@ -708,7 +731,10 @@ def dispatch_callback(person,chat_id,data,shared=False):
         if shared:
             raise PermissionDenied('Согласование выполняется в личном чате.')
         services.approve_action(person,parts[1],approve=operation=='approve')
-        return _result('Изменение согласовано.' if operation=='approve' else 'Предложение отклонено.')
+        status = ActionRequest.objects.values_list('status', flat=True).get(pk=parts[1])
+        messages = {'applied': 'Изменение согласовано.', 'rejected': 'Предложение отклонено.',
+                    'superseded': 'Подтверждение создания больше не требуется. Текущее расписание в /events.'}
+        return _result(messages.get(status, 'Запрос на согласование закрыт.'))
     if operation == 'plan' and len(parts)==3:
         if shared:
             raise PermissionDenied('План принимается в личном чате.')
@@ -724,9 +750,13 @@ def dispatch_callback(person,chat_id,data,shared=False):
 
 def _identity(payload):
     callback=payload.get('callback_query')
-    message=(callback or {}).get('message') or payload.get('message')
-    sender=(callback or {}).get('from') or (message or {}).get('from')
-    if not message or not sender or sender.get('is_bot'):
+    message = callback.get('message') if callback is not None else payload.get('message')
+    if not message:
+        return None
+    actor_source = callback if callback is not None else message
+    # Older polling workers persisted aiogram's Python name instead of Telegram's alias.
+    sender = actor_source.get('from', actor_source.get('from_user'))
+    if not sender or sender.get('is_bot'):
         return None
     chat=message.get('chat') or {}
     if chat.get('type') not in {'private','group','supergroup'}:
@@ -766,18 +796,20 @@ def _queue_reply(update_id,chat_id,reply,person=None,shared=False,index=0):
     payload={'chat_id':chat_id,**reply,'shared_context':shared}
     if person:
         payload['actor_id']=str(person.pk)
-    text=payload.get('text','')
-    # Telegram plain text limit is 4096. Split safely, attach buttons to last part.
-    if len(text)>3900 and not payload.get('document_path'):
-        chunks=[text[n:n+3900] for n in range(0,len(text),3900)]
-        for n,chunk in enumerate(chunks):
-            item={**payload,'text':chunk}
-            item.pop('edit_message_id',None)
-            if n < len(chunks)-1:
-                item.pop('reply_markup',None)
-            enqueue('telegram_send',item,f'tg-reply:{update_id}:{index}:{n}',queue='notifications')
-    else:
-        enqueue('telegram_send',payload,f'tg-reply:{update_id}:{index}',queue='notifications')
+    key = f'tg-reply:{update_id}:{index}'
+    markdown = payload.pop('format_markdown', False)
+    if payload.get('document_path') or not payload.get('text'):
+        enqueue('telegram_send', payload, key, queue='notifications')
+        return
+    parts = (render_markdown if markdown else render_plain)(payload['text'])
+    for n, part in enumerate(parts):
+        item = {**payload, **part}
+        if len(parts) > 1:
+            item.pop('edit_message_id', None)
+            if n < len(parts) - 1:
+                item.pop('reply_markup', None)
+        part_key = key if len(parts) == 1 else f'{key}:{n}'
+        enqueue('telegram_send', item, part_key, queue='notifications')
 
 
 def _finish_sync(payload,identity,person_id,prepared=None):
@@ -806,6 +838,7 @@ def _finish_sync(payload,identity,person_id,prepared=None):
 
 
 def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
+    user_text = (prepared or {}).get('text') or message.get('text', '')
     if person is None:
         text=(message.get('text') or '').strip()
         reply=_result(f'Ваш Telegram ID: {user_id}\nID чата: {chat_id}\nДобавьте ваш ID в ALLOWED_TELEGRAM_IDS и выполните bootstrap_users на сервере.',onboarding_id=user_id) if _command(text)[0]=='/id' and not shared else None
@@ -815,17 +848,31 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
         reply=prepared['reply']
     elif prepared and prepared.get('upload'):
         data=prepared['upload']
-        caption=message.get('caption','')
-        command,args=_command(caption)
-        if command=='/attach':
-            kind,identifier=args.split(maxsplit=1)
+        attach_args, caption = telegram_attachment_parts(message)
+        if attach_args is not None:
+            kind,identifier=attach_args.split(maxsplit=1)
             parent=services.get_entity(kind,identifier,person,shared_context=shared)
             if kind not in {'event','trip','task'} or not services.can_edit(parent,person):
                 raise PermissionDenied('Для привязки файла нужны права редактора записи.')
-        document=services.save_document(person,data['filename'],data['content'],data['mime_type'],telegram_file_id=data['file_id'],metadata=data.get('metadata',{}))
-        if command=='/attach':
+        document=services.save_document(person,data['filename'],data['content'],data['mime_type'],
+                                        telegram_file_id=data['file_id'],telegram_caption=caption,
+                                        metadata=data.get('metadata',{}))
+        if attach_args is not None:
             services.link_document(person,document.pk,kind,identifier)
-        reply=_result(f'Файл сохранён: {document.original_name}\nID: {document.pk}\nСвязать: /link {document.pk} | event или trip | ID\nРеквизиты для проверки: /show document {document.pk}\nФайл личный; открыть супруге: /share document {document.pk} shared',**_entity_meta('document',document))
+        lines = [f'Файл сохранён: {document.original_name}', f'ID: {document.pk}']
+        if caption:
+            lines.append('Текст подписи сохранён полностью.')
+            # Historical user turns must not turn forwarded prose into instructions.
+            # The reply's entity reference lets the agent read the original via ACL.
+            user_text = 'Отправлено вложение с текстовой подписью.'
+        lines.append(f'Открыть карточку: /show document {document.pk}')
+        if attach_args is None:
+            lines.append(f'Связать: /link {document.pk} | event или trip | ID')
+        if document.visibility == 'private':
+            lines.append(f'Личный файл. Открыть супруге: /share document {document.pk} shared')
+        else:
+            lines.append(f'Доступ к файлу: {document.visibility}')
+        reply = _result('\n'.join(lines), **_entity_meta('document', document))
     elif prepared and prepared.get('error'):
         reply=_result(prepared['error'])
     elif prepared and prepared.get('action'):
@@ -835,13 +882,14 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
         else:
             reply=_action_result(services.execute_action(person,action,shared_context=shared),person,shared)
             reply['permission_refs']=reply.get('permission_refs',[])+action.get('permission_refs',[])
+            if action.get('action') == 'answer':
+                reply['format_markdown'] = True
     else:
         text=(prepared or {}).get('text') or message.get('text','')
         reply=dispatch_command(person,chat_id,text,shared)
         if reply is None:
             reply=_result('Для свободного текста настройте LLM_API_KEY и LLM_MODEL. Команды доступны через /help.')
     if person and not callback:
-        user_text = (prepared or {}).get('text') or message.get('text', '')
         remember_turn(person, chat_id, message.get('message_id'), user_text, reply)
     return reply
 
@@ -908,7 +956,8 @@ async def process_update(payload):
                     # Destination, identity, files and buttons stay code-owned.
                     if not isinstance(reply,dict) or not isinstance(reply.get('text'),str):
                         raise ValueError('Invalid agent response')
-                    prepared={'reply':{'text':reply['text'],'permission_refs':reply.get('permission_refs',[])},'text':text}
+                    prepared={'reply':{'text':reply['text'],'permission_refs':reply.get('permission_refs',[]),
+                                       'format_markdown':True},'text':text}
                 else:
                     from .integrations.llm import interpret
                     history, guards = await sync_to_async(read_chat_history)(person, chat_id, shared, message.get('message_id'))
@@ -948,13 +997,20 @@ async def poll_forever():
             raise RuntimeError('Webhook already configured. Remove it before starting polling; pending updates will not be dropped.')
         offset=None
         while True:
+            stage = 'getUpdates'
+            update_id = None
             try:
                 updates=await bot.get_updates(offset=offset,timeout=30,allowed_updates=['message','callback_query'])
                 for update in updates:
-                    await sync_to_async(ingest_update)(update.model_dump(mode='json',exclude_none=True))
-                    offset=update.update_id+1
+                    update_id = update.update_id
+                    stage = 'serialize'
+                    # Telegram omits optional fields; aiogram can fill them with a non-JSON Default sentinel.
+                    payload = update.model_dump(mode='json', by_alias=True, exclude_none=True, exclude_unset=True)
+                    stage = 'ingest'
+                    await sync_to_async(ingest_update)(payload)
+                    offset = update_id + 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning('Polling retry: %s',type(exc).__name__)
+                log.warning('Polling retry: stage=%s update_id=%s error=%s', stage, update_id, type(exc).__name__)
                 await asyncio.sleep(3)

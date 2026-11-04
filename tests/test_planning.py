@@ -120,15 +120,20 @@ def test_accept_rechecks_changed_limit_and_task_version(users):
     assert not Event.objects.exists()
 
 
-def test_accept_joint_task_requests_second_consent(users):
+@pytest.mark.parametrize('accepting_participant', [0, 1])
+def test_either_participant_can_accept_a_joint_task_block(users, accepting_participant):
     a,b=users
     t=task(a,visibility='shared');t.participants.add(b)
     build_daily_plan(a,DAY)
-    result=accept_plan(a,DAY)
-    assert len(result)==1 and result[0].status=='proposed'
-    assert ActionRequest.objects.get(target_id=result[0].pk).approver==b
-    assert set(result[0].reminders.values_list('status',flat=True))=={'paused'}
+    build_daily_plan(b,DAY)
+    result=accept_plan(users[accepting_participant],DAY)
+    assert len(result)==1 and result[0].status=='confirmed'
+    assert not ActionRequest.objects.filter(target_id=result[0].pk).exists()
+    assert set(result[0].reminders.values_list('recipient_id','status'))=={(a.pk,'pending'),(b.pk,'pending')}
+    with pytest.raises(ValidationError, match='размещена'):
+        accept_plan(users[1-accepting_participant],DAY)
     assert proposals(build_daily_plan(a,DAY))==[]
+    assert proposals(build_daily_plan(b,DAY))==[]
 
 
 def test_accept_rechecks_dependency_that_was_reopened(users):

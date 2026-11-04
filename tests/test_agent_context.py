@@ -8,7 +8,7 @@ from assistant import services
 from assistant.agent.context import create_context,AgentLimitExceeded
 from assistant.agent.egress import EgressGuard
 from assistant.agent.operations import execute_operation
-from assistant.models import AgentRun,AgentToolCall,Task,Job,ActionRequest
+from assistant.models import AgentRun,AgentToolCall,Task,Job,ActionRequest,Event
 
 pytestmark=pytest.mark.django_db(transaction=True)
 
@@ -85,16 +85,20 @@ def test_tool_limit_stops_before_another_side_effect(people,settings):
     assert Task.objects.count()==1
 
 
-def test_joint_approval_survives_trip_metadata_link(people):
-    a,b=people;ctx=context(a)
-    trip=services.create_trip(a,title='Поездка',visibility='shared')
+@pytest.mark.parametrize('actor_index', [0, 1])
+def test_agent_creates_joint_event_and_links_trip_without_spouse_approval(people, actor_index):
+    a,b=people
+    actor = people[actor_index]
+    ctx=context(actor)
+    trip=services.create_trip(actor,title='Поездка',visibility='shared')
     result=operation(ctx,'create_event',{'title':'Общий рейс','visibility':'shared','participants':[str(a.pk),str(b.pk)],'starts_at':'2030-01-01T10:00:00+03:00','ends_at':'2030-01-01T12:00:00+03:00'})
-    assert result['status']=='awaiting_spouse_approval'
+    assert result['ok'] and result['status']=='confirmed'
     added=operation(ctx,'add_trip_segment',{'trip_id':str(trip.pk),'event_id':result['entity_id'],'origin':'Москва','destination':'Казань'})
     assert added['ok']
-    request=ActionRequest.objects.get(target_id=result['entity_id'])
-    event=services.approve_action(b,request.pk)
-    assert event.status=='confirmed'
+    event=Event.objects.get(pk=result['entity_id'])
+    assert event.status=='confirmed' and event.trip == trip and event.owner == actor
+    assert set(event.participants.all()) == set(people)
+    assert not ActionRequest.objects.filter(target_id=event.pk).exists()
 
 
 def test_private_chat_identity_cannot_be_forged(people):
@@ -120,13 +124,27 @@ def test_egress_blocks_document_copy_but_permits_map_address(settings):
     guard.check({'origin':'Москва, Тверская 1','destination':'Шереметьево'})
 
 
+def test_egress_blocks_caption_copies_from_record_or_document_search(settings):
+    caption = 'После спектакля участники собираются около служебного входа для личной встречи.'
+    for result in (
+        {'record': {'kind': 'document', 'telegram_caption': caption}},
+        {'results': [{'document_id': 'doc', 'excerpt': caption}]},
+    ):
+        guard = EgressGuard()
+        guard.observe(result)
+        with pytest.raises(PermissionDenied):
+            guard.check({'query': caption})
+        guard.check({'destination': 'Театр LYCEUM'})
+
+
 def test_recalled_document_guards_follow_a_new_answer_and_block_external_search(people, settings, tmp_path):
     from assistant.chat_memory import remember_turn, history_for_agent
 
     person, spouse = people
     settings.MEDIA_ROOT = tmp_path
+    caption = 'Важная подробность для гостей содержится только в подписи пересланного вложения.'
     doc = services.save_document(spouse, 'ticket.txt', b'original', 'text/plain',
-                                 metadata={'booking_reference': 'ZXCV97'})
+                                 telegram_caption=caption, metadata={'booking_reference': 'ZXCV97'})
     services.share_entity(spouse, 'document', doc.pk, 'shared')
     guard = {'kind': 'document', 'id': str(doc.pk)}
     remember_turn(person, person.chat_id, 100, 'Какой код?', {'text': 'ZXCV97', 'permission_refs': [guard]})
@@ -134,6 +152,8 @@ def test_recalled_document_guards_follow_a_new_answer_and_block_external_search(
     ctx.inherit_history(*history_for_agent(ctx))
     remote = Mock(return_value={'ok': True})
     denied = asyncio.run(ctx.dispatch('search_web', {'query':'ZXCV97'}, remote, external=True))
+    assert not denied['ok']
+    denied = asyncio.run(ctx.dispatch('search_web', {'query': caption}, remote, external=True))
     assert not denied['ok']
     remote.assert_not_called()
     reply = asyncio.run(ctx.finish('completed', 'Из билета: ZXCV97'))

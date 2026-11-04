@@ -120,7 +120,7 @@ def build_tools():
 
     @function_tool
     async def search_documents(ctx: ToolContext, query: str, offset: int = 0, limit: int = 10) -> dict:
-        """Search text and metadata of permitted uploaded documents, with source references."""
+        """Search Telegram captions, original text and metadata of permitted files with source references."""
         return await _read(ctx, 'search_documents', dict(query=query,offset=offset,limit=limit))
 
     @function_tool
@@ -170,7 +170,7 @@ def build_tools():
 
     @function_tool
     async def create_event(ctx: ToolContext, data: EventArgs) -> dict:
-        """Create an event. Joint participation may return pending spouse approval, not a confirmed event."""
+        """For a joint event use shared visibility and both allowed participant IDs. Either spouse can create it directly."""
         return await _operation(ctx, 'create_event', data.model_dump(mode='json',exclude_none=True))
 
     @function_tool

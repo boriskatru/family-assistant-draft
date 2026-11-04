@@ -188,6 +188,8 @@ def create_event(user,**data):
     start=_dt(data.get('starts_at'),user,True,data.get('timezone')); end=_dt(data.get('ends_at'),user,True,data.get('end_timezone') or data.get('timezone'))
     if end<=start: raise ValidationError('Конец должен быть позже начала')
     people=_people(data.get('participants'),user)
+    if len(people) > 2:
+        raise ValidationError('У события может быть не более двух участников.')
     if any(p.id!=user.id for p in people) and base['visibility']!='shared':
         raise ValidationError('Совместное событие должно быть общим')
     list(Person.objects.select_for_update().filter(pk__in=[p.id for p in people]).order_by('pk'))
@@ -198,11 +200,24 @@ def create_event(user,**data):
     if any(not 0<=x<=525600 for x in minutes): raise ValidationError('Некорректный интервал напоминания')
     obj=Event.objects.create(**base,**_linked(data,user),starts_at=start,ends_at=end,timezone=tz,end_timezone=endtz,location=str(data.get('location',''))[:500],kind=data.get('kind','meeting'),flexible=bool(data.get('flexible',False)),buffer_before=max(0,int(data.get('buffer_before',0))),buffer_after=max(0,int(data.get('buffer_after',0))),meeting_url=data.get('meeting_url',''),all_day=bool(data.get('all_day',False)),start_date=data.get('start_date') or None,end_date=data.get('end_date') or None)
     obj.participants.set(people)
-    req=_request(user,obj,{'status':'confirmed'},'confirm_event') if any(p.id!=user.id for p in people) else None
-    if req: obj.status='proposed';obj.save(update_fields=['status'])
+    # Either attendee can book for both. A booking solely for someone else
+    # still requires that person's agreement.
+    if user not in people:
+        obj.status = 'proposed'
+        obj.save(update_fields=['status'])
+        _request(user, obj, {'status': 'confirmed'}, 'confirm_event')
     for person in people:
         for offset in sorted(set(minutes)):
             Reminder.objects.create(event=obj,recipient=person,due_at=start-timedelta(minutes=offset),offset_minutes=offset,object_version=obj.version,status='pending' if obj.status=='confirmed' else 'paused')
+        if obj.status == 'confirmed' and person != user and person.chat_id:
+            local_start = start.astimezone(ZoneInfo(person.timezone))
+            enqueue('telegram_send', {
+                'actor_id': str(person.pk), 'chat_id': person.chat_id,
+                'text': f'В вашем общем расписании появилось событие «{obj.title}».\n'
+                        f'{local_start:%d.%m.%Y %H:%M} ({person.timezone})\n'
+                        f'Организатор — {user.name}.\n/show event {obj.pk}',
+                'permission_refs': [{'kind': 'event', 'id': str(obj.pk)}],
+            }, f'joint-event:{obj.pk}:{person.pk}', queue='notifications')
     if data.get('checklist'): make_checklist(user,'event',obj.id,', '.join(data['checklist']) if isinstance(data['checklist'],list) else data['checklist'])
     if data.get('meeting'): obj.kind='call';obj.save(update_fields=['kind'])
     if obj.status=='confirmed':
@@ -330,13 +345,21 @@ def context_for(user,shared_context=False):
 
 
 @transaction.atomic
-def save_document(user,filename,content,mime_type,**metadata):
+def save_document(user,filename,content,mime_type,*,telegram_caption='',**metadata):
     if len(content)>settings.MAX_UPLOAD_MB*1024*1024:raise ValidationError('Файл превышает допустимый размер')
     name=get_valid_filename(Path(filename.replace('\\','/')).name)[:200] or 'document'
     sha=hashlib.sha256(content).hexdigest()
-    existing=Document.objects.filter(owner=user,sha256=sha).first()
-    if existing:return existing
-    doc=Document(owner=user,title=name,original_name=name,mime_type=mime_type[:100],size=len(content),sha256=sha,document_type=metadata.get('document_type','other'),telegram_file_id=metadata.get('telegram_file_id',''),metadata=metadata.get('metadata',{}))
+    caption = telegram_caption if telegram_caption and telegram_caption.strip() else ''
+    # Two workers can receive the same upload before either document exists.
+    Person.objects.select_for_update().only('pk').get(pk=user.pk)
+    for existing in Document.objects.filter(owner=user, sha256=sha).order_by('created_at', 'pk'):
+        if existing.telegram_caption == caption:
+            return existing
+    fields = dict(metadata.get('metadata') or {})
+    fields.pop('telegram_caption', None)
+    if caption:
+        fields['telegram_caption'] = caption
+    doc=Document(owner=user,title=name,original_name=name,mime_type=mime_type[:100],size=len(content),sha256=sha,document_type=metadata.get('document_type','other'),telegram_file_id=metadata.get('telegram_file_id',''),metadata=fields)
     if mime_type=='application/pdf':
         try:
             from .integrations.pdf_text import extract_pdf

@@ -398,7 +398,7 @@ def plan_permission_refs(person, day):
 
 @transaction.atomic
 def accept_plan(person, day):
-    """Validate the stored draft, lock participants, then create accepted/proposed events."""
+    """Validate the stored draft, lock its attendees, and book their task blocks."""
     from .services import can_view, create_event
     day = _day(day)
     plan = DailyPlan.objects.select_for_update().get(person=person, day=day)
@@ -462,15 +462,12 @@ def accept_plan(person, day):
     result = []
     for item in proposals:
         task = Task.objects.get(pk=item['task_id'])
-        # The assignee's action is necessary for events owned by the other person.
-        if task.owner_id != person.pk and task.assignee_id != person.pk:
-            raise PermissionDenied('Принять план должен ответственный по задаче.')
         event = create_event(person, title=task.title, task_id=str(task.pk), project_id=str(task.project_id) if task.project_id else None,
                              trip_id=str(task.trip_id) if task.trip_id else None, starts_at=item['starts_at'], ends_at=item['ends_at'],
                              timezone=person.timezone, end_timezone=person.timezone, domain=task.domain,
                              visibility=task.visibility, participants=item['participants'], flexible=True, kind='task',
                              buffer_after=max(int((a.profile or {}).get('break_minutes',10)) for a in _participants(task)))
-        item['state'] = 'confirmed' if event.status=='confirmed' else 'awaiting_approval'
+        item['state'] = event.status
         item['event_id'] = str(event.pk)
         result.append(event)
     plan.status = 'accepted'

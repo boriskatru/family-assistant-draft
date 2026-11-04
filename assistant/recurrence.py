@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 from dateutil.rrule import rrulestr
 from dateutil.tz import datetime_exists, resolve_imaginary
+from django.conf import settings
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
 from django.utils import timezone
@@ -108,8 +109,12 @@ def create_rule_from_event(user, event, rrule='', mode='calendar', cycle=None):
         raise ValidationError('Сначала подтвердите событие.')
     if event.recurrence_id:
         raise ValidationError('Событие уже относится к серии.')
-    if event.participants.exclude(pk=user.pk).exists():
-        raise ValidationError('Совместные серии требуют отдельного согласования; в черновике создавайте отдельные общие события.')
+    attendees = set(event.participants.values_list('telegram_id', flat=True))
+    if attendees - {user.telegram_id}:
+        if not attendees.issubset(settings.ALLOWED_TELEGRAM_IDS):
+            raise PermissionDenied('Участник не разрешён')
+        if user.telegram_id not in attendees or event.visibility != 'shared' or len(attendees) != 2:
+            raise ValidationError('Для совместной серии нужно общее событие с участием обоих супругов.')
     zone = ZoneInfo(event.timezone)
     if mode == 'calendar':
         rrule = _checked_rrule(rrule,event.starts_at.astimezone(zone))
@@ -202,6 +207,8 @@ def _new_reminders(obj, template):
         return
     templates=template.get('reminders',[])
     if not templates:
+        if isinstance(obj, Event) and 'reminders' in template and len(template.get('participants', [])) > 1:
+            return
         templates=[{'recipient_id':str(obj.owner_id),'offset_minutes':15,'kind':'reminder'}]
     for data in templates:
         recipient=Person.objects.filter(pk=data.get('recipient_id')).first()
@@ -276,6 +283,11 @@ def materialize_recurrences(now=None):
             rule=RecurrenceRule.objects.select_for_update().select_related('owner').get(pk=rule_id)
             if not rule.active:
                 continue
+            participants = rule.template.get('participants', [])
+            if rule.kind == 'event' and len(participants) > 1:
+                allowed = Person.objects.filter(pk__in=participants, telegram_id__in=settings.ALLOWED_TELEGRAM_IDS)
+                if allowed.count() != len(participants):
+                    continue
             for moment in _occurrences(rule,lower,upper):
                 key=occurrence_key(moment)
                 model=Event if rule.kind=='event' else Task

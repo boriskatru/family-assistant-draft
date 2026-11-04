@@ -108,7 +108,11 @@ def search_records(user, kind, query='', date_from=None, date_to=None, status=''
     qs = visible(model.objects.all(), user, shared_context, include_busy=kind == 'event')
     if query.strip():
         # Never use hidden titles as a search predicate: that would be an oracle.
-        qs = visible(qs, user, shared_context).filter(Q(title__icontains=query.strip()) | Q(description__icontains=query.strip()))
+        term = query.strip()
+        matches = Q(title__icontains=term) | Q(description__icontains=term)
+        if kind == 'document':
+            matches |= Q(metadata__telegram_caption__iregex=re.escape(term))
+        qs = visible(qs, user, shared_context).filter(matches)
     if status:
         if kind == 'document' or len(status) > 30:
             raise ValidationError('Этот статус не поддерживается.')
@@ -226,10 +230,14 @@ def read_record(user, kind, record_id, shared_context=False):
             refs += [_ref('document', d, user, shared_context) for d in docs]
         if kind == 'document':
             # Original paths and storage configuration are never exposed.
-            metadata_text = json.dumps(obj.metadata, ensure_ascii=False, default=str)
+            metadata = obj.metadata
+            if isinstance(metadata, dict) and 'telegram_caption' in metadata:
+                data['telegram_caption'] = obj.telegram_caption
+                metadata = {key: value for key, value in metadata.items() if key != 'telegram_caption'}
+            metadata_text = json.dumps(metadata, ensure_ascii=False, default=str)
             data.update(document_type=obj.document_type)
             if len(metadata_text) <= 16000:
-                data['metadata'] = obj.metadata
+                data['metadata'] = metadata
             else:
                 data.update(metadata_excerpt=metadata_text[:16000], metadata_truncated=True)
     return {'record': data, 'permission_refs': refs, 'sources': [_source(kind, obj)], 'untrusted_content': True}
@@ -281,13 +289,15 @@ def _document_text(doc):
         ocr = doc.metadata.get('extracted_text', '') if isinstance(doc.metadata, dict) else ''
         if isinstance(ocr, str) and len(ocr) > len(stored):
             stored = ocr
-        chunks = [(None, stored[:MAX_DOCUMENT_CHARS])]
+        chunks = [(None, stored[:MAX_DOCUMENT_CHARS])] if stored or not doc.telegram_caption else []
         truncated = truncated or len(stored) > MAX_DOCUMENT_CHARS
-        if not stored.strip():
+        if not stored.strip() and not doc.telegram_caption:
             warnings.append('Текст отсутствует. Для сканов и фотографий требуется распознавание документов.')
+    if doc.telegram_caption:
+        chunks.insert(0, (None, 'Подпись в Telegram:\n' + doc.telegram_caption))
     if isinstance(doc.metadata, dict):
         metadata = {key: value for key, value in doc.metadata.items()
-                    if key != 'extracted_text' and value not in (None, '', [], {})}
+                    if key not in {'extracted_text', 'telegram_caption'} and value not in (None, '', [], {})}
         if metadata:
             remainder = MAX_DOCUMENT_CHARS - sum(len(value) + 2 for _, value in chunks)
             if remainder > 0:

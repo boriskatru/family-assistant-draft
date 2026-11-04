@@ -6,7 +6,7 @@ import pytest
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.files.base import ContentFile
 
-from assistant import services
+from assistant import bot, services
 from assistant.models import Document, Event, Task, TripSegment
 from assistant.agent import retrieval
 
@@ -149,6 +149,53 @@ def test_document_ocr_fallback_and_path_guard(people, tmp_path, settings):
     doc.file.name = '../outside.txt'; doc.original_name='outside.txt'; doc.mime_type='text/plain'; doc.save()
     with pytest.raises(PermissionDenied):
         retrieval.read_document(a, str(doc.pk))
+
+
+def test_document_caption_preserved_alongside_ocr_and_acl(people, tmp_path, settings):
+    owner, spouse = people
+    settings.MEDIA_ROOT = tmp_path
+    caption = 'Английский театр LYCEUM\n' + '🎭 ' * 300 + 'Юбилей (35+)'
+    ocr = 'Тётка Чарли · 13.11.2026 16:00'
+    doc = services.save_document(owner, 'афиша.jpg', b'photo', 'image/jpeg',
+                                 metadata={'extracted_text': ocr}, telegram_caption=caption)
+    query = 'юбилей (35+)'
+    results = retrieval.search_documents(owner, 'Юбилей Чарли')['results']
+    assert [r['document_id'] for r in results] == [str(doc.pk)]
+    assert retrieval.search_records(owner, 'document', query)['items'][0]['id'] == str(doc.pk)
+    assert retrieval.search_records(owner, 'document', 'юбилей .*')['items'] == []
+    read = retrieval.read_document(owner, doc.pk)
+    assert caption in read['text'] and ocr in read['text']
+    assert read['text'].count(caption) == 1 and read['untrusted_content']
+    card = bot.dispatch_command(owner, owner.chat_id, f'/show document {doc.pk}', False)
+    assert caption in card['text'] and 'Распознанные сведения' not in card['text']
+    assert retrieval.search_documents(spouse, query)['results'] == []
+    assert retrieval.search_records(owner, 'document', query, shared_context=True)['total'] == 0
+    with pytest.raises(PermissionDenied):
+        bot.dispatch_command(spouse, spouse.chat_id, f'/show document {doc.pk}', False)
+    with pytest.raises(PermissionDenied):
+        retrieval.read_record(spouse, 'document', doc.pk)
+
+
+def test_caption_survives_full_document_and_metadata_budgets(people, tmp_path, settings, monkeypatch):
+    owner, _ = people
+    caption = 'Уникальная подпись'
+    monkeypatch.setattr(retrieval, 'MAX_DOCUMENT_CHARS', 20000)
+    doc = document(owner, 'x' * 22000, tmp_path, settings,
+                   metadata={'extracted_text': 'x' * 22000}, telegram_caption=caption)
+    result = retrieval.read_document(owner, doc.pk, limit=100)
+    assert caption in result['text'] and result['content_truncated']
+    record = retrieval.read_record(owner, 'document', doc.pk)['record']
+    assert record['telegram_caption'] == caption and record['metadata_truncated']
+
+
+def test_caption_can_be_read_without_ocr(people, tmp_path, settings):
+    owner, _ = people
+    settings.MEDIA_ROOT = tmp_path
+    doc = services.save_document(owner, 'photo.jpg', b'photo', 'image/jpeg', telegram_caption='Места в партере')
+    result = retrieval.read_document(owner, doc.pk)
+    assert result['text'] == 'Подпись в Telegram:\nМеста в партере'
+    assert result['warnings'] == []
+    assert retrieval.search_documents(owner, 'партере')['results'][0]['document_id'] == str(doc.pk)
 
 
 def test_document_structured_metadata_search_and_long_offsets(people, tmp_path, settings):

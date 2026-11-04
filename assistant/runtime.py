@@ -13,6 +13,7 @@ from django.utils import timezone
 from .models import Person,Reminder,Event,Task,Job,Delivery,IncomingUpdate,Document
 from .queue import enqueue
 from .services import can_view, get_entity, ENTITY_MODELS
+from .telegram_format import render_plain
 
 logger=logging.getLogger(__name__)
 
@@ -21,8 +22,15 @@ def _tg(method, data, files=None):
     if not settings.TELEGRAM_BOT_TOKEN: raise RuntimeError('Telegram is not configured')
     with httpx.Client(timeout=30) as client:
         response=client.post(f'https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/{method}', data=data if files else None, json=None if files else data, files=files)
-    if response.status_code==400 and method=='editMessageText' and 'message is not modified' in str(response.json().get('description','')):
-        return {'message_id':data.get('message_id')}
+    if response.status_code == 400 and method in ('sendMessage', 'editMessageText'):
+        description = str(response.json().get('description', '')).lower()
+        if method == 'editMessageText' and 'message is not modified' in description:
+            return {'message_id': data.get('message_id')}
+        # Retry this part as plain text only after a definitive formatting rejection.
+        if data.get('entities') and any(reason in description for reason in
+                ("can't parse entities", "can't parse message text", 'entity_bounds_invalid',
+                 'entities_too_long', 'wrong http url', 'unsupported url protocol')):
+            return _tg(method, {key: value for key, value in data.items() if key != 'entities'})
     if response.status_code!=200: raise RuntimeError(f'Telegram request failed ({response.status_code})')
     result=response.json()
     if not result.get('ok'):raise RuntimeError('Telegram rejected request')
@@ -75,16 +83,24 @@ def send_payload(job,payload):
             doc=get_entity('document',payload['entity_id'],actor,chat_id==settings.SHARED_CHAT_ID)
             path=Path(doc.file.path).resolve()
             if Path(settings.MEDIA_ROOT).resolve() not in path.parents:raise PermissionError('Invalid file path')
-            data['caption']=str(payload.get('caption',''))[:1024]
+            caption = doc.telegram_caption or str(payload.get('caption', ''))
+            if len(caption) > 1024:
+                caption = f'{doc.original_name}\nПолная подпись: /show document {doc.pk}'
+            data['caption'] = caption
             if markup:data['reply_markup']=json.dumps(markup)
             with path.open('rb') as f:
                 result=_tg('sendDocument',data,files={'document':(doc.original_name,f,doc.mime_type)})
         else:
             text=str(payload.get('text','')) or 'Готово.'
-            chunks=[text[i:i+3900] for i in range(0,len(text),3900)]
+            # Queued entities are already relative to this one rendered part.
+            # Other producers and older outbox entries provide literal text.
+            if payload.get('entities'):
+                chunks = [{'text': text, 'entities': payload['entities']}]
+            else:
+                chunks = render_plain(text)
             result={}
             for i,chunk in enumerate(chunks):
-                part={'chat_id':chat_id,'text':chunk}
+                part={'chat_id':chat_id,**chunk}
                 if markup and i==len(chunks)-1:part['reply_markup']=markup
                 if payload.get('edit_message_id') and len(chunks)==1:
                     part['message_id']=int(payload['edit_message_id'])

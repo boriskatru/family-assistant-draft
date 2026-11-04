@@ -3,10 +3,12 @@ import asyncio
 from datetime import timedelta
 from unittest.mock import patch
 import pytest
+from aiogram.types import File, Update, WebhookInfo
+from django.core.management import call_command
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.utils import timezone
 from assistant import bot, services
-from assistant.models import ChecklistItem, Conversation, Event, IncomingUpdate, Job, Project, Task, TripSegment
+from assistant.models import ActionRequest, ChecklistItem, Conversation, Document, Event, IncomingUpdate, Job, Project, Task, TripSegment
 
 pytestmark=pytest.mark.django_db
 
@@ -46,6 +48,46 @@ def test_identity_rejects_wrong_group_and_private_sender(settings):
     assert bot._identity(update(shared=True,chat=-499)) is None
     assert bot._identity(update(user=1001,chat=1002)) is None
     assert bot._identity(update(shared=True,chat=-500))[2] is True
+
+
+@pytest.mark.django_db(transaction=True)
+def test_polled_start_reaches_telegram_send(people, settings):
+    person, _ = people
+    settings.TELEGRAM_BOT_TOKEN = '1234:test'
+    payload = update(text='/start', user=person.telegram_id)
+    payload['message']['from']['first_name'] = 'Борис'
+    payload['message']['date'] = 1700000000
+    telegram_update = Update.model_validate(payload)
+    no_webhook = WebhookInfo(url='', has_custom_certificate=False, pending_update_count=0)
+    with patch.object(bot.Bot, 'get_webhook_info', return_value=no_webhook), \
+         patch.object(bot.Bot, 'get_updates', side_effect=[[telegram_update], asyncio.CancelledError()]) as poll:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(bot.poll_forever())
+    assert poll.await_args.kwargs['offset'] == telegram_update.update_id + 1
+    stored = IncomingUpdate.objects.get(update_id=telegram_update.update_id)
+    assert stored.payload['message']['from']['id'] == person.telegram_id
+
+    call_command('runworker', queue='chat', once=True)
+    with patch('assistant.runtime._tg', return_value={'message_id': 123}) as send:
+        call_command('runworker', queue='notifications', once=True)
+    send.assert_called_once_with('sendMessage', {'chat_id': person.telegram_id, 'text': bot.HELP})
+
+
+def test_legacy_poll_senders_respect_private_chat_and_callback_actor(people):
+    person, spouse = people
+    payload = update(text='/start')
+    message = payload['message']
+    message['from_user'] = message.pop('from')
+    assert bot._find_person(bot._identity(payload)) == person
+
+    # A callback belongs to the user who pressed it, not to the message author.
+    callback = {'from_user': {'id': spouse.telegram_id}, 'message': message}
+    assert bot._identity({'callback_query': callback}) is None
+    message['chat']['id'] = spouse.telegram_id
+    assert bot._find_person(bot._identity({'callback_query': callback})) == spouse
+    del callback['from_user']
+    message['chat']['id'] = person.telegram_id
+    assert bot._identity({'callback_query': callback}) is None
 
 
 def test_onboarding_id_does_not_grant_access(people):
@@ -214,14 +256,33 @@ def test_group_attachment_never_downloads_or_exposes_document(people,settings):
     assert 'личный чат' in replies()[0].payload['text']
 
 
-def test_joint_event_without_llm_requests_spouse_approval(people):
-    person,spouse=people
-    reply=bot.dispatch_command(person,person.chat_id,'/event 2026-12-02 14:00 | 60 | Семейный обед | Кафе | shared | 1001,1002')
-    obj=Event.objects.get(title='Семейный обед')
-    assert obj.status=='proposed'
-    assert obj.participants.count()==2
-    assert 'proposed' in reply['text']
-    assert Job.objects.filter(kind='telegram_send',payload__chat_id=spouse.chat_id).exists()
+@pytest.mark.parametrize('actor_index', [0, 1])
+def test_either_spouse_can_schedule_a_joint_event_via_command(people, actor_index):
+    actor = people[actor_index]
+    reply = bot.dispatch_command(actor, actor.chat_id, '/event 2026-12-02 14:00 | 60 | Семейный обед | Кафе | shared | 1001,1002')
+    event = Event.objects.get(pk=reply['entity_id'])
+    assert event.owner == actor and event.status == 'confirmed'
+    assert set(event.participants.all()) == set(people)
+    assert 'confirmed' in reply['text']
+    assert not ActionRequest.objects.filter(target_id=event.pk).exists()
+    assert not Job.objects.filter(dedup_key__startswith='action:').exists()
+
+
+@pytest.mark.parametrize('button', ['approve', 'reject'])
+def test_old_resolved_creation_buttons_report_the_actual_status(people, button):
+    owner, spouse = people
+    event = services.create_event(owner, title='Спектакль', visibility='shared',
+                                  participants=[str(p.pk) for p in people], starts_at='2030-01-01T12:00:00+03:00',
+                                  ends_at='2030-01-01T13:00:00+03:00')
+    request = ActionRequest.objects.create(initiator=owner, approver=spouse, kind='confirm_event', status='superseded',
+                                          target_type='event', target_id=event.pk, target_version=event.version,
+                                          changes={'status': 'confirmed'}, expires_at=timezone.now())
+    with pytest.raises(PermissionDenied):
+        bot.dispatch_callback(owner, owner.chat_id, f'{button}:{request.pk}')
+    result = bot.dispatch_callback(spouse, spouse.chat_id, f'{button}:{request.pk}')
+    assert 'больше не требуется' in result['text']
+    event.refresh_from_db()
+    assert event.status == 'confirmed'
 
 
 def test_task_project_and_assignee_without_llm(people):
@@ -264,7 +325,6 @@ def test_google_command_network_and_token_state_are_outside_update_transaction(p
 
 
 def test_uploaded_original_is_saved_private_and_served_by_id(people,tmp_path,settings):
-    from assistant.models import Document
     person,spouse=people
     settings.MEDIA_ROOT=tmp_path
     original=b'original ticket bytes'
@@ -281,6 +341,70 @@ def test_uploaded_original_is_saved_private_and_served_by_id(people,tmp_path,set
     reply=bot.dispatch_command(spouse,spouse.chat_id,f'/get {document.pk}')
     assert reply['document_path']==document.file.path
     assert reply['entity_id']==str(document.pk)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_forwarded_photo_keeps_caption_and_allows_private_followup(people, settings, tmp_path):
+    from assistant.integrations.llm import LLMError
+    person, spouse = people
+    settings.MEDIA_ROOT = tmp_path
+    settings.TELEGRAM_BOT_TOKEN = '1234:test'
+    settings.LLM_API_KEY = 'test-only'
+    settings.LLM_DOCUMENT_MODEL = 'test-only'
+    caption = ' Театр LYCEUM 🎭\n\n«Тётка Чарли» — сбор в фойе, вход с площади.  '
+    payload = update(user=person.telegram_id)
+    message = payload['message']
+    del message['text']
+    message.update(date=1793880000, caption=caption,
+                   photo=[{'file_id': 'photo1', 'file_unique_id': 'unique', 'width': 200, 'height': 300}],
+                   forward_origin={'type': 'hidden_user', 'date': 1793800000, 'sender_user_name': 'Театр'})
+    message['from']['first_name'] = 'Борис'
+    wire_update = Update.model_validate(payload).model_dump(mode='json', by_alias=True, exclude_none=True)
+    bot.ingest_update(wire_update)
+
+    async def download(path, *, destination, timeout):
+        destination.write(b'poster-image')
+
+    remote_file = File(file_id='photo1', file_unique_id='unique', file_path='photos/poster.jpg')
+    with patch.object(bot.Bot, 'get_file', return_value=remote_file), \
+         patch.object(bot.Bot, 'download_file', side_effect=download), \
+         patch('assistant.integrations.llm._post_response', side_effect=LLMError('OCR unavailable')):
+        call_command('runworker', queue='chat', once=True)
+    document = Document.objects.get(owner=person)
+    assert document.file.read() == b'poster-image'
+    assert document.metadata['telegram_caption'] == caption
+    assert document.metadata['extracted_text'] == ''
+    assert not Event.objects.exists()
+    receipt = replies()[0].payload
+    assert 'Текст подписи сохранён полностью' in receipt['text']
+    assert receipt['entity_id'] == str(document.pk)
+    history, refs = bot.read_chat_history(person, person.chat_id, False, current_message_id=2)
+    assert refs == [{'kind': 'document', 'id': str(document.pk)}]
+    assert caption not in str(history)
+    assert str(document.pk) in history[-1]['content']
+    assert bot.read_chat_history(spouse, spouse.chat_id, False) == ([], [])
+
+
+def test_attach_caption_is_a_command_only_for_direct_uploads(people, settings, tmp_path):
+    person, _ = people
+    settings.MEDIA_ROOT = tmp_path
+    parent = event(person)
+    command = f'/attach event {parent.pk}'
+    description = '  Вход со двора.\nЗапасной вход закрыт.  '
+    caption = f'{command}\n{description}'
+    assert bot.telegram_attachment_parts({'caption': command}) == (f'event {parent.pk}', '')
+    assert bot.telegram_attachment_parts({'caption': description}) == (None, description)
+    for index, forwarded in enumerate([True, False], start=1):
+        payload = update(identifier=index, text='')
+        payload['message']['caption'] = caption
+        if forwarded:
+            payload['message']['forward_date'] = 1760000000
+        data = {'filename': f'{index}.pdf', 'content': bytes([index]), 'mime_type': 'text/plain',
+                'file_id': f'file{index}', 'metadata': {}}
+        process_sync(payload, person, {'upload': data})
+        doc = Document.objects.get(telegram_file_id=data['file_id'])
+        assert doc.metadata['telegram_caption'] == (caption if forwarded else description)
+        assert parent.documents.filter(pk=doc.pk).exists() == (not forwarded)
 
 
 def test_stale_daily_plan_button_cannot_accept_replaced_draft(people):

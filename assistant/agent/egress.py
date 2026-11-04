@@ -39,24 +39,31 @@ class EgressGuard:
         if not isinstance(text,str):return
         for match in self.labels.finditer(text):self._add(match.group(1).strip())
 
+    def _document_phrases(self, text):
+        if not isinstance(text, str) or len(self.phrases) >= 3000:
+            return
+        words = re.findall(r'\w+', text.casefold())
+        for index in range(len(words) - 7):
+            phrase = ''.join(words[index:index+8])
+            if len(phrase) >= 40:
+                self.phrases.add(phrase)
+                if len(self.phrases) >= 3000:
+                    return
+
     def observe(self,result):
         def walk(value):
             if isinstance(value,dict):
                 for key,child in value.items():
+                    # Protect long quotes from captions, retrieved chunks and
+                    # search excerpts while permitting short names and addresses.
+                    if key == 'telegram_caption' or (value.get('document_id') and key in ('text', 'excerpt')):
+                        self._document_phrases(child)
                     if self.sensitive_keys.search(key):self._add(child)
                     else:walk(child)
             elif isinstance(value,list):
                 for child in value:walk(child)
             elif isinstance(value,str):self._text(value)
         walk(result)
-        # Disallow verbatim sizeable fragments of an uploaded document in a
-        # public URL/query; location fields may still be used for map routing.
-        text=result.get('text') if result.get('document_id') else None
-        if isinstance(text,str):
-            words=re.findall(r'\w+',text.casefold())
-            for index in range(max(0,len(words)-7)):
-                phrase=''.join(words[index:index+8])
-                if len(phrase)>=40 and len(self.phrases)<3000:self.phrases.add(phrase)
 
     def check(self,arguments):
         value=json.dumps(arguments,ensure_ascii=False)

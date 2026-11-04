@@ -160,6 +160,11 @@ class Document(Owned):
     trips = models.ManyToManyField(Trip, blank=True, related_name='documents')
     tasks = models.ManyToManyField(Task, blank=True, related_name='documents')
 
+    @property
+    def telegram_caption(self):
+        value = self.metadata.get('telegram_caption') if isinstance(self.metadata, dict) else None
+        return value if isinstance(value, str) else ''
+
 
 class Checklist(Base):
     event = models.ForeignKey(Event, null=True, blank=True, on_delete=models.CASCADE, related_name='checklists')

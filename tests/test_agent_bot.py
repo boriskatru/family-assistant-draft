@@ -8,7 +8,7 @@ from asgiref.sync import sync_to_async
 from django.core.exceptions import PermissionDenied
 from django.db import connection
 
-from assistant import bot, services
+from assistant import bot, runtime, services
 from assistant.models import AgentRun, Conversation, IncomingUpdate, Job, Task
 
 pytestmark=pytest.mark.django_db
@@ -48,6 +48,32 @@ def test_agent_runs_outside_outbox_transaction_and_update_is_not_replayed(people
     assert 'document_path' not in reply and 'reply_markup' not in reply
     assert Conversation.objects.get(person=person).pending=={}
     assert IncomingUpdate.objects.get(update_id=901).status=='completed'
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize('use_agent', [True, False])
+def test_model_markdown_reaches_telegram_in_both_modes(people, settings, use_agent):
+    person, _ = people
+    settings.AGENT_ENABLED = use_agent
+    question = 'Что у меня в четверг?'
+    answer = '### Четверг, 5 ноября\n- **10:00–13:00** — созвон.'
+    forbidden_entity = {'type': 'text_link', 'offset': 0, 'length': 1, 'url': 'https://invalid.test'}
+    agent_reply = {'text': answer, 'entities': [forbidden_entity], 'parse_mode': 'HTML'}
+    legacy = {'action': 'answer', 'args': {'text': answer}, 'reply': answer}
+    with patch('assistant.agent.runner.run_agent', new=AsyncMock(return_value=agent_reply)), \
+         patch('assistant.integrations.llm.interpret', return_value=legacy):
+        asyncio.run(bot.process_update(incoming(text=question)))
+    job = Job.objects.get(kind='telegram_send')
+    with patch.object(runtime, '_tg', return_value={'message_id': 42}) as tg:
+        runtime.handle_job(job)
+        runtime.handle_job(job)
+    tg.assert_called_once()
+    method, sent = tg.call_args.args
+    assert method == 'sendMessage' and sent['chat_id'] == person.chat_id
+    assert '**' not in sent['text'] and '###' not in sent['text']
+    assert [entity['type'] for entity in sent['entities']] == ['bold', 'bold']
+    assert 'parse_mode' not in sent
+    assert Conversation.objects.get(person=person).messages[-1]['assistant'] == answer
 
 
 @pytest.mark.django_db(transaction=True)

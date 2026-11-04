@@ -2,9 +2,10 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
-from django.core.exceptions import ValidationError
+from django.core.exceptions import ValidationError, PermissionDenied
 
-from assistant.models import Checklist, ChecklistItem, Event, OccurrenceOverride, Reminder, Task
+from assistant.models import ActionRequest, Checklist, ChecklistItem, Event, Job, OccurrenceOverride, Reminder, Task
+from assistant.services import create_event
 from assistant.recurrence import (create_rule_from_event, create_rule_from_task,
                                  materialize_recurrences, occurrence_key, on_task_completed)
 
@@ -107,11 +108,35 @@ def test_calendar_tasks_get_distinct_due_dates_and_defaults(people):
     assert materialize_recurrences(start)==0
 
 
-def test_joint_event_series_requires_explicit_future_consent(people):
+@pytest.mark.parametrize('remind_minutes', [[30], []])
+def test_joint_event_series_includes_both_in_each_occurrence(people, settings, remind_minutes):
+    a,b=people
+    start=datetime(2030,1,1,9,tzinfo=UTC)
+    first=create_event(a,title='Театр',visibility='shared',participants=[a.pk,b.pk],
+                       starts_at=start,ends_at=start+timedelta(hours=1),remind_minutes=remind_minutes)
+    rule=create_rule_from_event(a,first,rrule='FREQ=DAILY;COUNT=3')
+    settings.ALLOWED_TELEGRAM_IDS=(a.telegram_id,)
+    assert materialize_recurrences(start)==0
+    settings.ALLOWED_TELEGRAM_IDS=(a.telegram_id,b.telegram_id)
+    assert materialize_recurrences(start)==2 and materialize_recurrences(start)==0
+    for occurrence in Event.objects.filter(recurrence=rule):
+        assert occurrence.status=='confirmed' and set(occurrence.participants.all())=={a,b}
+        assert set(occurrence.reminders.values_list('recipient_id','offset_minutes','status')) == {
+            (person.pk,offset,'pending') for person in (a,b) for offset in remind_minutes
+        }
+    assert not ActionRequest.objects.exists()
+    assert Job.objects.filter(kind='telegram_send').count()==1
+
+
+def test_joint_event_series_cannot_schedule_only_for_other_or_revoked_user(people, settings):
     a,b=people
     first=event(a,datetime(2030,1,1,9,tzinfo=UTC),visibility='shared')
-    first.participants.add(b)
-    with pytest.raises(ValidationError,match='Совместные серии'):
+    first.participants.set([b])
+    with pytest.raises(ValidationError,match='с участием обоих'):
+        create_rule_from_event(a,first,rrule='FREQ=DAILY')
+    first.participants.add(a)
+    settings.ALLOWED_TELEGRAM_IDS = (a.telegram_id,)
+    with pytest.raises(PermissionDenied,match='не разрешён'):
         create_rule_from_event(a,first,rrule='FREQ=DAILY')
     first.refresh_from_db()
     assert first.recurrence_id is None

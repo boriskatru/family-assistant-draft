@@ -25,26 +25,62 @@ def test_private_busy_group(people):
     assert not s.visible(Event.objects.all(),a,True,True).exists()
 
 
-def test_joint_event_approval_and_idempotence(people):
-    a,b=people;e=event(a,visibility='shared',participants=[str(a.id),str(b.id)])
-    assert e.status=='proposed'
-    assert e.reminders.filter(status='pending').count()==0
-    req=ActionRequest.objects.get(target_id=e.id)
-    with pytest.raises(PermissionDenied):s.approve_action(a,req.id)
-    s.approve_action(b,req.id);e.refresh_from_db()
+@pytest.mark.parametrize('organiser', [0, 1])
+def test_either_attendee_can_book_for_both_but_edits_still_need_approval(people, organiser):
+    a, b = people[organiser], people[1-organiser]
+    e = event(a, visibility='shared', participants=[str(a.pk), str(b.pk)])
     assert e.status=='confirmed'
-    version=e.version
-    s.approve_action(b,req.id);e.refresh_from_db();assert e.version==version
+    assert set(e.participants.all()) == {a, b}
+    assert set(e.reminders.filter(status='pending').values_list('recipient_id', flat=True)) == {a.pk, b.pk}
+    assert not ActionRequest.objects.filter(target_id=e.pk).exists()
+    assert Job.objects.get(kind='google_event').payload['event_id'] == str(e.pk)
+    notice = Job.objects.get(kind='telegram_send')
+    assert notice.payload['chat_id'] == b.chat_id and not notice.payload.get('reply_markup')
+    assert a.name in notice.payload['text'] and e.title in notice.payload['text']
+    assert notice.payload['permission_refs'] == [{'kind': 'event', 'id': str(e.pk)}]
     req2=s.update_event(a,e.id,{'starts_at':(e.starts_at+timedelta(hours=1)).isoformat(),'ends_at':(e.ends_at+timedelta(hours=1)).isoformat()})
     assert isinstance(req2,ActionRequest)
+    with pytest.raises(PermissionDenied):s.approve_action(a,req2.id)
     before=e.starts_at;s.approve_action(b,req2.id);e.refresh_from_db()
     assert e.starts_at==before+timedelta(hours=1)
     assert all(r.object_version==e.version for r in e.reminders.all())
+    version=e.version
+    s.approve_action(b,req2.id);e.refresh_from_db();assert e.version==version
+
+
+def test_booking_only_for_the_other_person_still_requires_their_agreement(people):
+    a,b=people
+    e=event(a,visibility='shared',participants=[str(b.pk)])
+    assert e.status=='proposed' and e.reminders.get().status=='paused'
+    req=ActionRequest.objects.get(target_id=e.pk,kind='confirm_event',approver=b)
+    assert Job.objects.filter(dedup_key=f'action:{req.pk}').exists()
+    assert not Job.objects.filter(dedup_key__startswith='joint-event:').exists()
+    s.approve_action(b,req.pk)
+    e.refresh_from_db()
+    assert e.status=='confirmed' and e.reminders.get().status=='pending'
+
+
+@pytest.mark.parametrize('access_revoked', [False, True])
+def test_joint_notice_rechecks_privacy_and_is_sent_once(people, access_revoked):
+    a,b=people
+    e=event(a,visibility='shared',participants=[a.pk,b.pk])
+    notice=Job.objects.get(kind='telegram_send')
+    if access_revoked:
+        e.participants.remove(b)
+        s.share_entity(a,'event',e.pk,'private')
+    with patch('assistant.runtime._tg',return_value={'message_id':1}) as telegram:
+        handle_job(notice)
+        handle_job(notice)
+    telegram.assert_called_once()
+    method,out=telegram.call_args.args
+    assert method=='sendMessage' and out['chat_id']==b.chat_id
+    assert (e.title in out['text']) is (not access_revoked)
 
 
 def test_shared_view_is_not_edit(people):
     a,b=people;e=event(a,visibility='shared')
     assert s.can_view(e,b) and not s.can_edit(e,b)
+    assert list(e.participants.all())==[a] and not Job.objects.filter(kind='telegram_send').exists()
     with pytest.raises(PermissionDenied):s.update_event(b,e.id,{'title':'overwrite'})
 
 
@@ -65,6 +101,25 @@ def test_documents_no_link_acl_widening(people,tmp_path,settings):
     s.link_document(a,d.id,'event',e.id)
     with pytest.raises(PermissionDenied):s.get_entity('document',d.id,b)
     same=s.save_document(a,'other.pdf',b'%PDF-1.0\nfake','application/pdf');assert same.id==d.id
+
+
+def test_identical_image_with_a_different_caption_creates_a_private_document(people, tmp_path, settings):
+    owner, spouse = people
+    settings.MEDIA_ROOT = tmp_path
+    args = (owner, 'poster.jpg', b'image', 'image/jpeg')
+    poster = s.save_document(*args, metadata={'telegram_caption': 'invented by OCR', 'title': 'Lyceum'})
+    assert poster.metadata == {'title': 'Lyceum'}
+    s.share_entity(owner, 'document', poster.pk, 'shared')
+
+    caption = ' Личная заметка к афише\nТолько для меня. '
+    annotated = s.save_document(*args, telegram_caption=caption)
+    assert annotated.pk != poster.pk
+    assert annotated.telegram_caption == caption
+    assert s.save_document(*args, telegram_caption=caption).pk == annotated.pk
+    assert s.save_document(*args).pk == poster.pk
+    assert s.get_entity('document', poster.pk, spouse).telegram_caption == ''
+    with pytest.raises(PermissionDenied):
+        s.get_entity('document', annotated.pk, spouse)
 
 
 def test_stale_reminder_does_not_send(people):
