@@ -27,7 +27,7 @@ def test_private_busy_group(people):
 
 
 @pytest.mark.parametrize('organiser', [0, 1])
-def test_either_attendee_can_book_for_both_but_edits_still_need_approval(people, organiser):
+def test_either_attendee_can_book_and_edit_for_both_without_approval(people, organiser):
     a, b = people[organiser], people[1-organiser]
     e = event(a, visibility='shared', participants=[str(a.pk), str(b.pk)])
     assert e.status=='confirmed'
@@ -39,14 +39,14 @@ def test_either_attendee_can_book_for_both_but_edits_still_need_approval(people,
     assert notice.payload['chat_id'] == b.chat_id and not notice.payload.get('reply_markup')
     assert a.name in notice.payload['text'] and e.title in notice.payload['text']
     assert notice.payload['permission_refs'] == [{'kind': 'event', 'id': str(e.pk)}]
-    req2=s.update_event(a,e.id,{'starts_at':(e.starts_at+timedelta(hours=1)).isoformat(),'ends_at':(e.ends_at+timedelta(hours=1)).isoformat()})
-    assert isinstance(req2,ActionRequest)
-    with pytest.raises(PermissionDenied):s.approve_action(a,req2.id)
-    before=e.starts_at;s.approve_action(b,req2.id);e.refresh_from_db()
+    before=e.starts_at
+    updated=s.update_event(a,e.id,{'starts_at':(e.starts_at+timedelta(hours=1)).isoformat(),'ends_at':(e.ends_at+timedelta(hours=1)).isoformat()}, expected_version=e.version)
+    assert isinstance(updated,Event)
+    e.refresh_from_db()
     assert e.starts_at==before+timedelta(hours=1)
     assert all(r.object_version==e.version for r in e.reminders.all())
-    version=e.version
-    s.approve_action(b,req2.id);e.refresh_from_db();assert e.version==version
+    assert not ActionRequest.objects.filter(target_id=e.pk).exists()
+    assert Job.objects.filter(kind='telegram_send').count()==1
 
 
 def test_booking_only_for_the_other_person_still_requires_their_agreement(people):
@@ -82,9 +82,9 @@ def test_shared_event_is_editable_even_without_participation(people):
     a,b=people;e=event(a,visibility='shared')
     assert s.can_view(e,b) and s.can_edit(e,b)
     assert list(e.participants.all())==[a] and not Job.objects.filter(kind='telegram_send').exists()
-    request=s.update_event(b,e.id,{'title':'Обновлено'})
-    assert request.initiator==b and request.approver==a
-    s.approve_action(a,request.pk)
+    updated=s.update_event(b,e.id,{'title':'Обновлено'})
+    assert isinstance(updated,Event)
+    assert not ActionRequest.objects.filter(target_id=e.pk).exists()
     e.refresh_from_db()
     assert e.title=='Обновлено' and e.owner==a
 

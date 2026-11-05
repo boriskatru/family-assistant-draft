@@ -58,23 +58,23 @@ def test_private_place_does_not_widen_through_shared_event_or_trip(people):
     assert Event.objects.count() == 1
 
 
-def test_shared_place_selection_by_spouse_uses_approval_and_rechecks_changed_address(people):
+def test_shared_place_selection_is_immediate_and_keeps_snapshot_until_next_edit(people):
     owner, spouse = people
     location = place(owner, 'shared')
     first = event(owner, visibility='shared', participants=[owner.pk, spouse.pk])
-    request = services.update_event(spouse, first.pk, {'place_id': location.pk}, first.version)
-    assert isinstance(request, ActionRequest) and request.approver == owner
-    assert request.changes['place_snapshot']['address'] == location.address
+    updated = services.update_event(spouse, first.pk, {'place_id': location.pk}, first.version)
+    assert isinstance(updated, Event)
+    assert updated.place_id == location.pk and updated.location == location.address
+    snapshot = updated.place_snapshot.copy()
+    assert not ActionRequest.objects.exists()
     addressbook.save_place(owner, {'id': location.pk, 'expected_version': location.version,
                                    'address': 'Новый адрес'})
-    with pytest.raises(ValidationError, match='изменилась'):
-        services.approve_action(owner, request.pk)
     first.refresh_from_db()
-    assert first.place_id is None and first.location == ''
-    new_request = services.update_event(spouse, first.pk, {'place_id': location.pk}, first.version)
-    services.approve_action(owner, new_request.pk)
+    assert first.location == snapshot['address'] and first.place_snapshot == snapshot
+    services.update_event(spouse, first.pk, {'place_id': location.pk}, first.version)
     first.refresh_from_db()
     assert first.location == 'Новый адрес'
+    assert not ActionRequest.objects.exists()
 
 
 def test_plain_location_replacement_detaches_previous_place(people):

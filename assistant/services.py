@@ -288,8 +288,9 @@ def update_event(user,event_id,changes,expected_version=None,shared_context=Fals
     safe_changes={k:v.isoformat() if isinstance(v,datetime) else str(v) if isinstance(v,uuid.UUID) else v for k,v in changes.items()}
     safe_changes.update(event_place_fields(user,changes,changes.get('visibility',event.visibility),shared_context))
     validate_event_place(user,event,safe_changes)
-    req=_request(user,event,safe_changes)
-    return req or _apply_event(user,event,safe_changes)
+    # Both family members may edit shared events immediately. Creation of a
+    # booking solely for the other person retains its separate confirmation.
+    return _apply_event(user,event,safe_changes)
 
 
 @transaction.atomic
@@ -299,7 +300,7 @@ def approve_action(user,request_id,approve=True):
     event=Event.objects.select_for_update().get(pk=req.target_id)
     if req.status!='proposed':return event
     if req.expires_at<timezone.now():req.status='expired';req.save();raise ValidationError('Срок согласования истёк')
-    if event.version!=req.target_version:raise ValidationError('Событие изменилось; запросите новое согласование')
+    if event.version!=req.target_version:raise ValidationError('Событие изменилось; откройте актуальную запись и повторите нужную правку')
     if approve and not can_edit(event,req.initiator):
         raise PermissionDenied('Права автора запроса на изменение события отозваны.')
     req.status='applied' if approve else 'rejected';req.save()

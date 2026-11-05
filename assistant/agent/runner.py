@@ -231,7 +231,7 @@ def build_tools():
 
     @function_tool
     async def update_event(ctx: ToolContext, data: UpdateEventArgs) -> dict:
-        """Update/move/cancel a known event with the exact current version. Shared changes may need approval."""
+        """Update/move/cancel a known event with the exact current version. Either authorised spouse can edit shared events immediately, without spouse approval."""
         return await _operation(ctx, 'update_event', data.model_dump(mode='json',exclude_none=True))
 
     @function_tool

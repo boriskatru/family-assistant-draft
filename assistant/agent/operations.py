@@ -65,7 +65,7 @@ def execute_operation(ctx,name,args):
             result['status']='awaiting_spouse_approval'
         elif result.get('entity_type')=='event':
             event=Event.objects.get(pk=result['entity_id'])
-            result['status']='awaiting_spouse_approval' if event.status=='proposed' else event.status
+            result['status']='awaiting_spouse_approval' if name=='create_event' and event.status=='proposed' else event.status
         result['permission_refs']=refs
         return result
 
