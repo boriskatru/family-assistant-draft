@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from django.conf import settings
 from django.utils import timezone
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
 
 class LLMError(RuntimeError):
@@ -106,12 +106,17 @@ class EventArgs(CommonCreate):
     trip_id: UUID | None = None
     participants: list[UUID] | None = None
     location: str = Field(default='', max_length=500)
+    place_id: UUID | None = Field(default=None, description='A saved address-book place ID. Its address is copied into this event.')
     kind: Literal['meeting', 'work', 'travel', 'activity', 'call'] = 'meeting'
     flexible: bool = False
     buffer_before: int = Field(default=0, ge=0, le=1440)
     buffer_after: int = Field(default=0, ge=0, le=1440)
-    remind_minutes: list[int] = Field(default_factory=lambda: [15], max_length=8)
+    remind_minutes: list[int] | None = Field(default=None, max_length=8, description=(
+        'Use null for the normal reminder. Set [] only if the user explicitly disables reminders, '
+        'or supply offsets in minutes if requested.'))
     meeting: bool = False
+    meeting_url: HttpUrl | None = Field(default=None, max_length=2000, description=(
+        'An existing HTTP(S) call link supplied by the user or read from an authorized record.'))
     checklist: list[str] = Field(default_factory=list, max_length=100)
 
     @field_validator('starts_at', 'ends_at')
@@ -131,9 +136,18 @@ class EventArgs(CommonCreate):
                 raise ValueError('Unknown IANA timezone') from None
         return value
 
+    @field_validator('meeting_url')
+    @classmethod
+    def public_link(cls, value):
+        if value is not None and (value.username is not None or value.password is not None):
+            raise ValueError('Meeting URL must not contain user credentials')
+        return value
+
     @field_validator('remind_minutes')
     @classmethod
     def valid_offsets(cls, value):
+        if value is None:
+            return None
         if any(isinstance(v, bool) or v < 0 or v > 525600 for v in value):
             raise ValueError('Invalid reminder interval')
         return sorted(set(value), reverse=True)
@@ -158,6 +172,7 @@ class EventChanges(StrictArgs):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     location: str | None = Field(default=None, max_length=500)
+    place_id: UUID | None = None
     visibility: Literal['private', 'shared', 'busy_only'] | None = None
     status: Literal['confirmed', 'cancelled'] | None = None
 
@@ -239,6 +254,8 @@ SYSTEM_INSTRUCTIONS = '''Ты семейный помощник. Верни ро
 Если просят поставить событие для себя и супруга («нам», «на двоих», «с женой», «с мужем»),
 укажи visibility=shared и UUID обоих из allowed_context.people в participants.
 Для создания достаточно одного подтверждения автора предложения в этом режиме.
+Для созвона укажи kind=call, для переезда с точным временем — kind=travel. Если пользователь не
+указал интервал напоминания, оставь remind_minutes пустым значением null. [] отключает уведомления.
 Соблюдай current_time и timezone пользователя. Для даты со временем указывай ISO 8601 с offset;
 если нет времени, длительности или точного совпадения события, ответь уточняющим вопросом.
 Не выдумывай даты, участников, брони, билеты, адреса или результаты API.
@@ -375,7 +392,12 @@ def interpret(user, text: str, shared_context: bool = False, history: list | Non
     if safe_history:
         reference['recent_user_messages'] = safe_history
     inputs = [{'role': 'user', 'content': json.dumps(reference, ensure_ascii=False, default=str)}, {'role': 'user', 'content': text.strip()}]
-    envelope = _post_response('LLM_MODEL', inputs, SYSTEM_INSTRUCTIONS, ENVELOPE_SCHEMA, 'family_assistant_proposal')
+    from assistant.personal_context import build_instructions, PersonalContextError
+    try:
+        instructions=build_instructions(SYSTEM_INSTRUCTIONS,shared_context)
+    except PersonalContextError as exc:
+        raise LLMError(str(exc)) from None
+    envelope = _post_response('LLM_MODEL', inputs, instructions, ENVELOPE_SCHEMA, 'family_assistant_proposal')
     action = validate_action(envelope, shared_context=shared_context)
     # Queue delivery must check every source that may have informed the response.
     # Derive guards locally: the provider is never allowed to weaken or omit them.

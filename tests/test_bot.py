@@ -189,8 +189,12 @@ def test_checklist_desired_state_is_idempotent_and_rechecks_edit_permission(peop
     assert replies()[0].payload['edit_message_id']==1
     process_sync(update(3,user=spouse.telegram_id,callback=f'item:{item.pk}:0'),spouse)
     item.refresh_from_db()
-    assert item.checked_at
-    assert 'Нет прав' in replies()[-1].payload['text']
+    assert item.checked_at is None
+    services.share_entity(person,'event',item_event.pk,'private')
+    process_sync(update(4,user=spouse.telegram_id,callback=f'item:{item.pk}:1'),spouse)
+    item.refresh_from_db()
+    assert item.checked_at is None
+    assert 'Нет доступа' in replies()[-1].payload['text']
 
 
 def test_repeat_uses_template_with_reminders_and_original_occurrence(people):
@@ -204,13 +208,14 @@ def test_repeat_uses_template_with_reminders_and_original_occurrence(people):
     assert first.version==2
 
 
-def test_segment_inherits_visibility_and_denies_read_only_viewer(people):
+def test_segment_allows_shared_trip_editor_and_denies_private_trip(people):
     person,spouse=people
-    trip=services.create_trip(person,title='Путешествие',visibility='shared')
+    trip=services.create_trip(person,title='Путешествие')
     command=f'/segment {trip.pk} | 2026-12-01T10:00+03:00 | 2026-12-01T15:00+04:00 | transport | Москва | Дубай | Перелёт | 120,30,60'
     with pytest.raises(PermissionDenied):
         bot.dispatch_command(spouse,spouse.chat_id,command)
-    bot.dispatch_command(person,person.chat_id,command)
+    services.share_entity(person,'trip',trip.pk,'shared')
+    bot.dispatch_command(spouse,spouse.chat_id,command)
     segment=TripSegment.objects.get(trip=trip)
     assert segment.event.visibility=='shared'
     assert segment.checkin_minutes==120

@@ -27,6 +27,31 @@ def _day(value):
 
 
 def execute_operation(ctx,name,args):
+    if name in ('save_place','save_contact'):
+        from assistant import addressbook
+        kind = 'place' if name == 'save_place' else 'contact'
+        obj = getattr(addressbook,name)(ctx.person,args,shared_context=ctx.shared_context)
+        result = addressbook.read_addressbook(ctx.person,kind,obj.pk,shared_context=ctx.shared_context)
+        return {**result,'text':'Место сохранено.' if kind=='place' else 'Контакт сохранён.',
+                'entity_type':kind,'entity_id':str(obj.pk)}
+
+    if name == 'set_place_alias':
+        from assistant.addressbook import set_place_alias
+        return set_place_alias(ctx.person,shared_context=ctx.shared_context,**args)
+
+    if name == 'resolve_route_places':
+        points = [_object(ctx,'place',args[key]) for key in ('origin_place_id','destination_place_id')]
+        values = []
+        for place in points:
+            if place.latitude is not None and place.longitude is not None:
+                values.append(f'{place.latitude},{place.longitude}')
+            elif place.address.strip() and place.address_confirmed:
+                values.append(place.address.strip())
+            else:
+                raise ValidationError('Для маршрута нужны координаты или подтверждённый полный адрес обоих мест. Уточните адрес в карточке места.')
+        return {'origin':values[0],'destination':values[1],
+                'permission_refs':[_ref('place',obj) for obj in points]}
+
     if name in ACTION_TYPES and name not in ('list','answer'):
         action=validate_action({'action':name,'args_json':json.dumps(args,ensure_ascii=False,default=str),'reply':'Выполнить действие по запросу пользователя.'},shared_context=ctx.shared_context)
         if action['action']=='answer':return {'ok':False,'error':action['args']['text']}
@@ -82,6 +107,8 @@ def execute_operation(ctx,name,args):
             values[key]=int(values[key])
             if not 0<=values[key]<=10000:raise ValidationError('Некорректный запас времени или позиция.')
         for key in ('origin','destination'):values[key]=str(values[key])[:500]
+        target_visibility = 'shared' if 'shared' in (event.visibility,trip.visibility) else event.visibility
+        values.update(services.prepare_segment_places(ctx.person,args,target_visibility,ctx.shared_context))
         segment=TripSegment.objects.create(trip=trip,event=event,**values)
         if not event.trip_id:
             previous_version=event.version

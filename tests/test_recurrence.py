@@ -22,7 +22,7 @@ def event(person,start,**kwargs):
 def test_rrule_preserves_wall_time_across_dst_and_is_idempotent(people):
     a,_=people;a.timezone='Europe/Berlin';a.save()
     start=datetime(2030,3,24,9,tzinfo=ZoneInfo(a.timezone))
-    first=event(a,start)
+    first=create_event(a, title='Series', starts_at=start, ends_at=start+timedelta(hours=1))
     rule=create_rule_from_event(a,first,rrule='FREQ=WEEKLY;COUNT=3')
     assert materialize_recurrences(start)==2
     assert materialize_recurrences(start)==0

@@ -248,3 +248,7 @@ DEBUG=1 pytest -q
 Настройки читаются из переменных процесса; локальный Python сам по себе не загружает `.env`. Compose загружает его автоматически. Для локального запуска используйте конфигурацию окружения IDE. Без `DATABASE_URL` допускается SQLite только для разработки; production Compose всегда использует PostgreSQL. Для параллельных worker и полного приёмочного прогона нужен PostgreSQL.
 
 Ссылки: [Docker на Ubuntu](https://docs.docker.com/engine/install/ubuntu/), [Google OAuth](https://developers.google.com/identity/protocols/oauth2/web-server), [Google Calendar API](https://developers.google.com/workspace/calendar/api/guides/overview), [Agents SDK](https://developers.openai.com/api/docs/guides/agents/sdk), [Places API](https://developers.google.com/maps/documentation/places/web-service/overview), [Routes API](https://developers.google.com/maps/documentation/routes/overview), [Brave Search API](https://api-dashboard.search.brave.com/app/documentation/web-search).
+
+## Адресная книга и персональный профиль
+
+Обновление добавляет миграцию `0003_address_book`; автоматический сервис `migrate` применяет её до запуска workers. Для нового серверного файла выполните `sudo python3 scripts/init_personal_context.py`, затем заполните `private/personal_context.md`. Пустой файл допустим. Подробный порядок обновления и команды Telegram — [ADDRESS_BOOK.md](ADDRESS_BOOK.md), параметры профиля — [PERSONAL_CONTEXT.md](PERSONAL_CONTEXT.md). Адресная книга входит в резервную копию БД; файл профиля нужно резервировать отдельно.

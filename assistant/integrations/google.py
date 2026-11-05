@@ -26,6 +26,8 @@ from assistant.models import (
     OAuthState, Person, Reminder,
 )
 
+from assistant.reminder_defaults import event_reminder_minutes
+
 API = 'https://www.googleapis.com/calendar/v3'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
 AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
@@ -445,6 +447,11 @@ def _import_item(source, item):
                 return  # Local edit awaits outbound synchronization.
             if remote_changed and remote != local:
                 before = local
+                if 'location' in fields and fields['location'] != event.location:
+                    # The remote text is a new choice, not the saved directory
+                    # snapshot. Never keep an unrelated old place reference.
+                    event.place_id = None
+                    event.place_snapshot = {}
                 for key, value in fields.items():
                     setattr(event, key, value)
                 event.version += 1
@@ -463,8 +470,9 @@ def _import_item(source, item):
             event.participants.add(source.connection.person)
             binding = CalendarBinding.objects.create(source=source, event=event, external_id=external_id)
             if event.starts_at > timezone.now():
-                Reminder.objects.create(event=event, recipient=event.owner,
-                    due_at=event.starts_at - timedelta(minutes=15), object_version=event.version)
+                offset = event_reminder_minutes(event)
+                Reminder.objects.create(event=event, recipient=event.owner, offset_minutes=offset,
+                    due_at=event.starts_at.astimezone(dt_timezone.utc) - timedelta(minutes=offset), object_version=event.version)
         binding.etag = item.get('etag', '')
         binding.last_version = event.version
         binding.snapshot = _snapshot(event)

@@ -69,7 +69,7 @@ def test_coerces_ids_and_dates_to_json_safe_values():
     action = llm.validate_action(envelope('create_event', {'title': 'Созвон', 'starts_at': '2026-11-10T10:00:00+03:00', 'ends_at': '2026-11-10T11:00:00+03:00', 'participants': [uid]}))
     assert action['args']['participants'] == [uid]
     assert action['args']['starts_at'].endswith('+03:00')
-    assert action['args']['remind_minutes'] == [15]
+    assert 'remind_minutes' not in action['args']  # the service applies the event-type default
     assert 'timezone' not in action['args']  # service inherits the person's zone
     json.dumps(action)
 

@@ -16,6 +16,8 @@ from django.utils import timezone
 from .models import (Checklist, ChecklistItem, Event, OccurrenceOverride, Person,
                      RecurrenceRule, Reminder, Task)
 
+from .reminder_defaults import event_reminder_minutes
+
 UTC = dt_timezone.utc
 HORIZON_DAYS = 180
 MAX_OCCURRENCES_PER_RULE = 1000
@@ -69,13 +71,14 @@ def _reminder_template(obj):
 
 def _event_template(event):
     fields = ['title','description','domain','visibility','location','kind','flexible',
-              'buffer_before','buffer_after','timezone','end_timezone','packing_notes']
+              'buffer_before','buffer_after','timezone','end_timezone','packing_notes','place_snapshot']
     result = {f:getattr(event,f) for f in fields}
     result.update(duration_minutes=int((event.ends_at-event.starts_at).total_seconds()//60),
                   participants=[str(p.pk) for p in event.participants.all()],
                   project_id=str(event.project_id) if event.project_id else None,
                   task_id=str(event.task_id) if event.task_id else None,
                   trip_id=str(event.trip_id) if event.trip_id else None,
+                  place_id=str(event.place_id) if event.place_id else None,
                   all_day=event.all_day,
                   duration_days=(event.end_date-event.start_date).days if event.all_day and event.start_date and event.end_date else 1,
                   reminders=_reminder_template(event),
@@ -103,14 +106,14 @@ def _task_template(task):
 def create_rule_from_event(user, event, rrule='', mode='calendar', cycle=None):
     from .services import can_edit
     event = Event.objects.select_for_update().get(pk=event.pk)
-    if not can_edit(event,user) or event.owner_id != user.pk:
-        raise PermissionDenied('Создать серию может владелец события.')
+    if not can_edit(event,user):
+        raise PermissionDenied('Нет прав на создание серии этого события.')
     if event.status != 'confirmed':
         raise ValidationError('Сначала подтвердите событие.')
     if event.recurrence_id:
         raise ValidationError('Событие уже относится к серии.')
     attendees = set(event.participants.values_list('telegram_id', flat=True))
-    if attendees - {user.telegram_id}:
+    if event.owner_id != user.pk or attendees - {user.telegram_id}:
         if not attendees.issubset(settings.ALLOWED_TELEGRAM_IDS):
             raise PermissionDenied('Участник не разрешён')
         if user.telegram_id not in attendees or event.visibility != 'shared' or len(attendees) != 2:
@@ -125,7 +128,9 @@ def create_rule_from_event(user, event, rrule='', mode='calendar', cycle=None):
         rrule = ''
     else:
         raise ValidationError('События поддерживают режимы calendar и cycle.')
-    rule = RecurrenceRule.objects.create(owner=user,title=event.title,visibility=event.visibility,domain=event.domain,
+    # Configuring a shared recurrence does not transfer the original record or
+    # its future occurrences to the spouse who requested the change.
+    rule = RecurrenceRule.objects.create(owner=event.owner,title=event.title,visibility=event.visibility,domain=event.domain,
                                          kind='event',mode=mode,dtstart=event.starts_at,timezone=event.timezone,
                                          rrule=rrule,cycle=cycle,template=_event_template(event))
     event.recurrence = rule
@@ -207,9 +212,14 @@ def _new_reminders(obj, template):
         return
     templates=template.get('reminders',[])
     if not templates:
-        if isinstance(obj, Event) and 'reminders' in template and len(template.get('participants', [])) > 1:
-            return
-        templates=[{'recipient_id':str(obj.owner_id),'offset_minutes':15,'kind':'reminder'}]
+        if isinstance(obj, Event):
+            if 'reminders' in template:
+                return  # An explicitly empty event schedule also applies to each occurrence.
+            offset = event_reminder_minutes(obj)
+            recipients = obj.participants.values_list('pk', flat=True)
+            templates = [{'recipient_id': str(pk), 'offset_minutes': offset} for pk in recipients]
+        else:
+            templates = [{'recipient_id': str(obj.owner_id), 'offset_minutes': 15}]
     for data in templates:
         recipient=Person.objects.filter(pk=data.get('recipient_id')).first()
         if recipient is None:
@@ -236,7 +246,7 @@ def _clone_task(rule,moment,key,previous_task=None):
 
 def _clone_event(rule,moment,key,override):
     template=rule.template
-    values={f:template[f] for f in ['title','description','domain','visibility','location','kind','flexible','buffer_before','buffer_after','timezone','end_timezone','packing_notes','project_id','task_id','trip_id'] if f in template}
+    values={f:template[f] for f in ['title','description','domain','visibility','location','kind','flexible','buffer_before','buffer_after','timezone','end_timezone','packing_notes','project_id','task_id','trip_id','place_id','place_snapshot'] if f in template}
     zone=ZoneInfo(rule.timezone)
     values.update(owner=rule.owner,title=template.get('title',rule.title),recurrence=rule,occurrence_key=key,
                   starts_at=moment,ends_at=moment+timedelta(minutes=max(1,int(template.get('duration_minutes',60)))),
@@ -251,7 +261,7 @@ def _clone_event(rule,moment,key,override):
         for name,value in override.changes.items():
             if name in {'starts_at','ends_at'}:
                 values[name]=_datetime(value)
-            elif name in {'title','description','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after'}:
+            elif name in {'title','description','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot'}:
                 values[name]=value
     if values['ends_at']<=values['starts_at']:
         raise ValidationError('Некорректная длительность повторения.')

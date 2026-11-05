@@ -291,7 +291,7 @@ def build_daily_plan(person, day):
     return plan
 
 
-def render_daily_plan(person, day):
+def daily_plan_message(person, day):
     """Rebuild on every render to avoid leaking revoked access from an old snapshot."""
     from .services import can_view
     plan = build_daily_plan(person, day)
@@ -372,9 +372,14 @@ def render_daily_plan(person, day):
         lines.append('\nДля принятия блоков: /accept YYYY-MM-DD')
     # Store the sources of this exact rendered snapshot. Re-querying visibility
     # later could silently omit a source whose access was revoked in between.
-    plan.items.append({'kind':'permission_refs','refs':list(refs.values())})
+    permission_refs = list(refs.values())
+    plan.items.append({'kind':'permission_refs','refs':permission_refs})
     plan.save(update_fields=['items','updated_at'])
-    return '\n'.join(lines)
+    return {'text': '\n'.join(lines), 'permission_refs': permission_refs}
+
+
+def render_daily_plan(person, day):
+    return daily_plan_message(person, day)['text']
 
 
 def plan_permission_refs(person, day):

@@ -16,7 +16,7 @@ def _normal(value):
 
 
 class EgressGuard:
-    sensitive_keys=re.compile(r'booking_reference|reservation_code|passport|pnr|passengers?|ticket_number|card_number|api_key|secret|token',re.I)
+    sensitive_keys=re.compile(r'booking_reference|reservation_code|passport|pnr|passengers?|ticket_number|card_number|api_key|secret|token|access_notes|phone|email',re.I)
     labels=re.compile(r'(?:паспорт|passport|pnr|код брони|booking reference|номер билета)\s*[:#№]?\s*([A-ZА-Я0-9][A-ZА-Я0-9 -]{4,28})',re.I)
 
     def __init__(self,input_text=''):

@@ -32,6 +32,7 @@ from assistant.integrations.llm import (
     ChecklistArgs, CompleteTaskArgs, EventArgs, ProjectArgs, TaskArgs, TripArgs,
     UpdateEventArgs, _credentials,
 )
+from assistant.addressbook_schemas import ContactArgs, PlaceArgs
 from .prompts import SYSTEM_INSTRUCTIONS
 from .context import AgentInterrupted, AgentLimitExceeded
 
@@ -105,6 +106,13 @@ async def _external(wrapper, name, args):
     return await _dispatch(wrapper, name, args, lambda: fn(**args), external=True)
 
 
+async def _addressbook_read(wrapper, name, args):
+    from assistant import addressbook
+    fn = getattr(addressbook, name)
+    return await _dispatch(wrapper, name, args,
+        lambda: fn(wrapper.context.person, shared_context=wrapper.context.shared_context, **args))
+
+
 def build_tools():
     """Create independent typed native function tools for one run."""
     # ToolContext's first parameter is SDK-only; it is never exposed to the LLM.
@@ -117,6 +125,37 @@ def build_tools():
     async def read_record(ctx: ToolContext, kind: Literal['event','task','project','trip','document','checklist'], record_id: str) -> dict:
         """Read a permitted record and its current version before editing it."""
         return await _read(ctx, 'read_record', dict(kind=kind,record_id=record_id))
+
+    @function_tool
+    async def search_addressbook(ctx: ToolContext, kind: Literal['place','contact'], query: str = '', offset: int = 0, limit: int = 20) -> dict:
+        """Search saved places or contacts, including the speaker's personal place aliases.
+        Search before creating duplicates. If several places match, ask which one; do not guess."""
+        return await _addressbook_read(ctx, 'search_addressbook', dict(kind=kind,query=query,offset=offset,limit=limit))
+
+    @function_tool
+    async def read_addressbook(ctx: ToolContext, kind: Literal['place','contact'], record_id: str) -> dict:
+        """Read a permitted saved place/contact and current version before updating it."""
+        return await _addressbook_read(ctx, 'read_addressbook', dict(kind=kind,record_id=record_id))
+
+    @function_tool
+    async def save_place(ctx: ToolContext, data: PlaceArgs) -> dict:
+        """Create or update a saved place. For updates provide id and exact expected_version;
+        null fields preserve existing values, empty strings/lists explicitly clear them.
+        Only mark address_confirmed when the user or a verified source provides a full address.
+        Do not guess coordinates, private addresses or the user's current whereabouts."""
+        return await _operation(ctx, 'save_place', data.model_dump(mode='json',exclude_unset=True,exclude_none=True))
+
+    @function_tool
+    async def save_contact(ctx: ToolContext, data: ContactArgs) -> dict:
+        """Create or update a contact/organization; this grants no bot access and sends no messages.
+        Updating requires id and current expected_version. Null preserves fields; empty strings/lists clear them."""
+        return await _operation(ctx, 'save_contact', data.model_dump(mode='json',exclude_unset=True,exclude_none=True))
+
+    @function_tool
+    async def set_place_alias(ctx: ToolContext, place_id: str, alias: str, remove: bool = False) -> dict:
+        """Save/remove the speaker's personal name for a place, such as 'мама', 'дом' or 'офис'.
+        The same nickname can refer to different places for different users."""
+        return await _operation(ctx, 'set_place_alias', dict(place_id=place_id,alias=alias,remove=remove))
 
     @function_tool
     async def search_documents(ctx: ToolContext, query: str, offset: int = 0, limit: int = 10) -> dict:
@@ -154,6 +193,18 @@ def build_tools():
         return await _external(ctx, 'route_between', dict(origin=origin,destination=destination,mode=mode,departure_time=departure_time))
 
     @function_tool
+    async def route_places(ctx: ToolContext, origin_place_id: str, destination_place_id: str, mode: Literal['DRIVE','WALK','BICYCLE','TRANSIT'] = 'DRIVE', departure_time: str | None = None) -> dict:
+        """Estimate a route between two saved permitted places; only their coordinates/confirmed addresses go to maps.
+        Use a stated starting point, never assume a home address is the user's current location."""
+        prepared = await _operation(ctx, 'resolve_route_places',
+            dict(origin_place_id=origin_place_id,destination_place_id=destination_place_id), mutation=False)
+        if not prepared.get('ok'):
+            return prepared
+        result = await _external(ctx, 'route_between',
+            dict(origin=prepared['origin'],destination=prepared['destination'],mode=mode,departure_time=departure_time))
+        return {**result, 'permission_refs': prepared['permission_refs']}
+
+    @function_tool
     async def create_project(ctx: ToolContext, data: ProjectArgs) -> dict:
         """Create a project within the user's requested goal; visibility and participants are distinct."""
         return await _operation(ctx, 'create_project', data.model_dump(mode='json',exclude_none=True))
@@ -170,7 +221,9 @@ def build_tools():
 
     @function_tool
     async def create_event(ctx: ToolContext, data: EventArgs) -> dict:
-        """For a joint event use shared visibility and both allowed participant IDs. Either spouse can create it directly."""
+        """For a joint event use shared visibility and both allowed participant IDs. Either spouse can create it directly.
+        Set kind=call for calls and kind=travel for departures. Link known trip_id during creation.
+        Use null for default remind_minutes. Preserve a supplied meeting_url; request Meet only if asked."""
         return await _operation(ctx, 'create_event', data.model_dump(mode='json',exclude_none=True))
 
     @function_tool
@@ -199,9 +252,10 @@ def build_tools():
         return await _operation(ctx, 'send_document', dict(document_id=document_id))
 
     @function_tool
-    async def add_trip_segment(ctx: ToolContext, trip_id: str, event_id: str, origin: str, destination: str, kind: str = 'transport', position: int = 0, booking_status: str = 'planned', checkin_minutes: int = 0, baggage_minutes: int = 0, transfer_minutes: int = 0) -> dict:
-        """Attach a transport/stay segment to a trip using an existing event. Do not invent confirmed bookings."""
-        return await _operation(ctx, 'add_trip_segment', dict(trip_id=trip_id,event_id=event_id,origin=origin,destination=destination,kind=kind,position=position,booking_status=booking_status,checkin_minutes=checkin_minutes,baggage_minutes=baggage_minutes,transfer_minutes=transfer_minutes))
+    async def add_trip_segment(ctx: ToolContext, trip_id: str, event_id: str, origin: str = '', destination: str = '', kind: str = 'transport', position: int = 0, booking_status: str = 'planned', checkin_minutes: int = 0, baggage_minutes: int = 0, transfer_minutes: int = 0, origin_place_id: str | None = None, destination_place_id: str | None = None) -> dict:
+        """Attach a transport/stay segment to a trip using an existing event. Prefer saved place IDs for endpoints;
+        each endpoint keeps its address snapshot. Do not invent confirmed bookings."""
+        return await _operation(ctx, 'add_trip_segment', dict(trip_id=trip_id,event_id=event_id,origin=origin,destination=destination,kind=kind,position=position,booking_status=booking_status,checkin_minutes=checkin_minutes,baggage_minutes=baggage_minutes,transfer_minutes=transfer_minutes,origin_place_id=origin_place_id,destination_place_id=destination_place_id))
 
     @function_tool
     async def plan_day(ctx: ToolContext, day: str) -> dict:
@@ -225,11 +279,12 @@ def build_tools():
 
     @function_tool
     async def configure_recurrence(ctx: ToolContext, kind: Literal['event','task'], record_id: str, mode: Literal['calendar','after_completion','cycle'] = 'calendar', rrule: str = '', interval: int = 1, unit: Literal['day','week','month'] = 'month', cycle: list[bool] | None = None) -> dict:
-        """Create a recurrence for an existing record. Joint event series are not supported; calendar uses RRULE."""
+        """Create a recurrence for an existing record. Either spouse can configure a shared event attended by both; calendar uses RRULE."""
         return await _operation(ctx, 'configure_recurrence', dict(kind=kind,record_id=record_id,mode=mode,rrule=rrule,interval=interval,unit=unit,cycle=cycle))
 
-    return [search_records,read_record,search_documents,read_document,available_slots,
-            search_web,read_webpage,search_places,route_between,
+    return [search_records,read_record,search_addressbook,read_addressbook,save_place,save_contact,set_place_alias,
+            search_documents,read_document,available_slots,
+            search_web,read_webpage,search_places,route_between,route_places,
             create_project,create_trip,create_task,create_event,update_event,complete_task,make_checklist,
             link_document,send_document,add_trip_segment,plan_day,accept_daily_plan,check_trip,
             set_checklist_item,configure_recurrence]
@@ -355,7 +410,9 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
             reference = await sync_to_async(_input_reference)(ctx)
         # REST supports both TTLs; the pinned SDK's typed field only accepts 30m.
         cache_options = {'mode': 'implicit', 'ttl': settings.LLM_PROMPT_CACHE_TTL}
-        agent=Agent(name='Family assistant',instructions=SYSTEM_INSTRUCTIONS,
+        from assistant.personal_context import build_instructions
+        instructions = await sync_to_async(build_instructions)(SYSTEM_INSTRUCTIONS, getattr(ctx,'shared_context',False))
+        agent=Agent(name='Family assistant',instructions=instructions,
                     model=model,tools=build_tools() if tools is None else tools,
                     model_settings=ModelSettings(parallel_tool_calls=False,store=False,
                         extra_body={'prompt_cache_options': cache_options} if cache_breakpoints else None,
@@ -373,7 +430,7 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
             # Reserve the current turn, tools, instructions and configured output
             # first. Fit recent whole exchanges into the same estimator as BudgetHooks.
             history_chars = (settings.AGENT_MAX_TOTAL_TOKENS - settings.AGENT_MAX_OUTPUT_TOKENS) * 3
-            history_chars -= _prompt_chars(SYSTEM_INSTRUCTIONS, agent.tools, [prefix, current])
+            history_chars -= _prompt_chars(instructions, agent.tools, [prefix, current])
             history, guards = await sync_to_async(history_for_agent)(ctx, max_history_chars=max(0, history_chars))
             await sync_to_async(ctx.inherit_history)(history, guards)
         inputs = [prefix, *history, current]
@@ -397,6 +454,9 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
     except AgentInterrupted:
         return await ctx.finish('interrupted','Обработка прервана. Сохранённые результаты:\n'+await ctx.partial_summary())
     except Exception as exc:
+        from assistant.personal_context import PersonalContextError
+        if isinstance(exc,PersonalContextError):
+            return await ctx.finish('failed',str(exc))
         # SDK wraps application exceptions from function tools as UserError,
         # retaining the original cause. Preserve normal hard-limit semantics.
         stop=_stop_cause(exc)

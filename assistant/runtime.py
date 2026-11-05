@@ -9,10 +9,11 @@ import httpx
 from django.conf import settings
 from django.core.exceptions import PermissionDenied,ValidationError
 from django.db import transaction
+from django.db.models import F, Q
 from django.utils import timezone
-from .models import Person,Reminder,Event,Task,Job,Delivery,IncomingUpdate,Document
+from .models import Person,Reminder,Event,Task,Job,Delivery,IncomingUpdate,Document,Trip
 from .queue import enqueue
-from .services import can_view, get_entity, ENTITY_MODELS
+from .services import can_view, get_entity, visible, ENTITY_MODELS
 from .telegram_format import render_plain
 
 logger=logging.getLogger(__name__)
@@ -122,31 +123,76 @@ def _quiet_end(person,now):
     return datetime.combine(day,end,tzinfo=ZoneInfo(person.timezone))
 
 
+def _trips_to_notify(person, local):
+    # Trip has a local start date without an exact departure time. Catch up until
+    # the end of the preceding local day if either the server or chat was offline.
+    if local.time() < time(8) or _quiet_end(person, local):
+        return Trip.objects.none()
+    trips = Trip.objects.filter(starts_on=local.date() + timedelta(days=1), status='planned')
+    travelers = Q(participants=person) | Q(owner=person, participants__isnull=True)
+    return visible(trips.filter(travelers), person)
+
+
+def _send_trip_reminder(job):
+    payload = job.payload
+    person = Person.objects.filter(pk=payload['person_id'], chat_id__isnull=False,
+                                   telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).first()
+    trip = None
+    if person and person.chat_id == person.telegram_id:
+        local = timezone.now().astimezone(ZoneInfo(person.timezone))
+        trip = _trips_to_notify(person, local).filter(pk=payload['trip_id'], starts_on=payload['starts_on']).first()
+    if trip is None:
+        # An unsent job must not suppress a later eligible tick after a timezone,
+        # membership, quiet-hours or visibility change. Keep its audit record.
+        Job.objects.filter(pk=job.pk, lock_token=job.lock_token).exclude(delivery__status='sent').update(
+            dedup_key=f'skipped-trip-reminder:{job.pk}', status='done', lock_token=None, locked_until=None)
+        return
+    text = f'Завтра поездка «{trip.title}» · {trip.starts_on:%d.%m.%Y}\n/show trip {trip.pk}'
+    return send_payload(job, {'chat_id': person.chat_id, 'actor_id': str(person.pk),
+                              'entity_type': 'trip', 'entity_id': str(trip.pk), 'text': text})
+
+
 def schedule_tick(now=None):
     now=now or timezone.now()
-    for reminder in Reminder.objects.filter(status='pending',due_at__lte=now).select_related('event','task','recipient')[:500]:
-        obj=reminder.event if reminder.event_id else reminder.task
-        if obj.version!=reminder.object_version or obj.status in ('cancelled','done','proposed'):
-            reminder.status='cancelled';reminder.save(update_fields=['status']);continue
-        if not can_view(obj,reminder.recipient):
-            reminder.status='cancelled';reminder.save(update_fields=['status']);continue
-        if now-reminder.due_at>timedelta(minutes=15):
-            reminder.status='missed';reminder.save(update_fields=['status']);continue
-        quiet_end=_quiet_end(reminder.recipient,now)
-        due=quiet_end or now
-        if reminder.event_id and due>=obj.ends_at:
-            reminder.status='missed';reminder.save(update_fields=['status']);continue
-        enqueue('reminder',{'reminder_id':str(reminder.id),'object_version':obj.version},f'reminder:{reminder.id}:v{obj.version}',due,queue='notifications')
-        reminder.status='queued';reminder.save(update_fields=['status'])
-    for p in Person.objects.filter(chat_id__isnull=False,telegram_id__in=settings.ALLOWED_TELEGRAM_IDS):
+    due_reminders = Reminder.objects.filter(
+        status='pending', due_at__lte=now, recipient__telegram_id__in=settings.ALLOWED_TELEGRAM_IDS,
+        recipient__chat_id=F('recipient__telegram_id'),
+    ).select_related('event', 'task', 'recipient').order_by('due_at', 'pk')
+    for reminder in due_reminders[:500]:
+        obj = reminder.event if reminder.event_id else reminder.task
+        pending = Reminder.objects.filter(pk=reminder.pk, status='pending',
+                                          object_version=reminder.object_version, due_at=reminder.due_at)
+        if (obj.version != reminder.object_version or obj.status in ('cancelled', 'done', 'proposed')
+                or not can_view(obj, reminder.recipient)):
+            pending.update(status='cancelled')
+            continue
+        due = _quiet_end(reminder.recipient, now) or now
+        if now - reminder.due_at > timedelta(minutes=15) or (reminder.event_id and due >= obj.ends_at):
+            pending.update(status='missed')
+            continue
+        # Make the job visible at the same commit as the claim. If the source
+        # moved while this tick was inspecting it, leave its new reminder alone.
+        with transaction.atomic():
+            if pending.update(status='queued'):
+                enqueue('reminder', {'reminder_id': str(reminder.id), 'object_version': obj.version},
+                        f'reminder:{reminder.id}:v{obj.version}', due, queue='notifications')
+    for p in Person.objects.filter(chat_id=F('telegram_id'), telegram_id__in=settings.ALLOWED_TELEGRAM_IDS):
         local=now.astimezone(ZoneInfo(p.timezone));scheduled=datetime.combine(local.date(),p.morning_time,tzinfo=ZoneInfo(p.timezone))
+        for trip_id, start in _trips_to_notify(p, local).values_list('pk', 'starts_on'):
+            enqueue('trip_reminder', {'trip_id': str(trip_id), 'starts_on': start.isoformat(), 'person_id': str(p.pk)},
+                    f'trip-reminder:{trip_id}:{p.pk}:{start}', now, queue='notifications')
         if scheduled<=local<scheduled+timedelta(hours=3):
             enqueue('daily_plan',{'person_id':str(p.id),'day':str(local.date())},f'daily:{p.id}:{local.date()}',queue='notifications')
-        missed=list(Reminder.objects.filter(recipient=p,status='missed').values_list('id',flat=True)[:100])
-        if missed and not _quiet_end(p,now):
-            key='missed:'+str(p.id)+':'+str(missed[0])
-            enqueue('telegram_send',{'actor_id':str(p.id),'chat_id':p.chat_id,'text':f'Пока сервис был недоступен или действовали тихие часы, пропущено напоминаний: {len(missed)}. Проверьте /today.'},key,queue='notifications')
-            Reminder.objects.filter(id__in=missed).update(status='summarized')
+        if not _quiet_end(p, now):
+            with transaction.atomic():
+                missed = list(Reminder.objects.select_for_update().filter(recipient=p, status='missed')
+                              .order_by('pk').values_list('pk', 'object_version')[:100])
+                if missed:
+                    key = f'missed:{p.pk}:{missed[0][0]}:v{missed[0][1]}'
+                    enqueue('telegram_send', {'actor_id': str(p.pk), 'chat_id': p.chat_id,
+                            'text': f'Пока сервис был недоступен или действовали тихие часы, пропущено напоминаний: {len(missed)}. Проверьте /today.'},
+                            key, queue='notifications')
+                    Reminder.objects.filter(pk__in=[pk for pk, _ in missed]).update(status='summarized')
     hour=now.strftime('%Y%m%d%H');minute=int(now.timestamp())//120
     enqueue('recurrence',{},f'recurrence:{hour}')
     enqueue('google_sync',{},f'google_sync:{minute}')
@@ -171,18 +217,32 @@ def handle_job(job):
     if job.kind=='recurrence':
         from .recurrence import materialize_recurrences
         return materialize_recurrences()
+    if job.kind=='trip_reminder':
+        return _send_trip_reminder(job)
     if job.kind=='daily_plan':
-        person=Person.objects.get(pk=p['person_id'])
-        from .planning import render_daily_plan,plan_permission_refs
-        from django.utils.dateparse import parse_date
-        text=render_daily_plan(person,parse_date(p['day']))
-        return send_payload(job,{'chat_id':person.chat_id,'actor_id':str(person.id),'text':text,'permission_refs':plan_permission_refs(person,parse_date(p['day']))})
+        from .planning import daily_plan_message
+        person = Person.objects.filter(pk=p['person_id'], telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).first()
+        if not person or person.chat_id != person.telegram_id:
+            return
+        today = timezone.now().astimezone(ZoneInfo(person.timezone)).date()
+        if p['day'] != today.isoformat() or Delivery.objects.filter(job=job, chat_id=person.chat_id, status='sent').exists():
+            return
+        message = daily_plan_message(person, today)
+        return send_payload(job, {'chat_id': person.chat_id, 'actor_id': str(person.pk), **message})
     if job.kind=='reminder':
         reminder=Reminder.objects.select_related('event','task','recipient').get(pk=p['reminder_id'])
         obj=reminder.event if reminder.event_id else reminder.task
-        if reminder.status not in ('queued','pending') or obj.version!=p['object_version'] or obj.status in ('cancelled','done','proposed') or not can_view(obj,reminder.recipient):return
-        if reminder.event_id and timezone.now()>=obj.ends_at:
-            reminder.status='missed';reminder.save();return
+        if (reminder.status not in ('queued', 'pending') or obj.version != p['object_version']
+                or reminder.object_version != p['object_version'] or obj.status in ('cancelled', 'done', 'proposed')
+                or not can_view(obj, reminder.recipient)):
+            return
+        current = Reminder.objects.filter(pk=reminder.pk, object_version=p['object_version'],
+                                          status__in=('queued', 'pending'), due_at=reminder.due_at)
+        recipient = reminder.recipient
+        if (recipient.chat_id != recipient.telegram_id or recipient.telegram_id not in settings.ALLOWED_TELEGRAM_IDS
+                or (reminder.event_id and timezone.now() >= obj.ends_at)):
+            current.update(status='missed')
+            return
         local=(obj.starts_at if reminder.event_id else obj.due_at).astimezone(ZoneInfo(reminder.recipient.timezone))
         text=f'Напоминание: {obj.title}\n{local:%d.%m %H:%M} ({reminder.recipient.timezone})'
         buttons=[]
@@ -194,5 +254,7 @@ def handle_job(job):
                 if remaining.exists():text+='\nЧто взять: '+', '.join(remaining.values_list('text',flat=True))
                 if len(buttons)<5:buttons.append([{'text':'Что взять: '+checklist.title[:30],'callback_data':f'things:{checklist.id}:0'}])
         send_payload(job,{'chat_id':reminder.recipient.chat_id,'actor_id':str(reminder.recipient.id),'entity_type':'event' if reminder.event_id else 'task','entity_id':str(obj.id),'text':text,'reply_markup':{'inline_keyboard':buttons} if buttons else None})
-        reminder.status='sent';reminder.save(update_fields=['status']);return
+        # The event may have been rescheduled during Telegram's network call.
+        current.update(status='sent')
+        return
     raise ValueError('Unknown job kind')

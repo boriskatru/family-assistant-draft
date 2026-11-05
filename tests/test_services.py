@@ -77,11 +77,15 @@ def test_joint_notice_rechecks_privacy_and_is_sent_once(people, access_revoked):
     assert (e.title in out['text']) is (not access_revoked)
 
 
-def test_shared_view_is_not_edit(people):
+def test_shared_event_is_editable_even_without_participation(people):
     a,b=people;e=event(a,visibility='shared')
-    assert s.can_view(e,b) and not s.can_edit(e,b)
+    assert s.can_view(e,b) and s.can_edit(e,b)
     assert list(e.participants.all())==[a] and not Job.objects.filter(kind='telegram_send').exists()
-    with pytest.raises(PermissionDenied):s.update_event(b,e.id,{'title':'overwrite'})
+    request=s.update_event(b,e.id,{'title':'Обновлено'})
+    assert request.initiator==b and request.approver==a
+    s.approve_action(a,request.pk)
+    e.refresh_from_db()
+    assert e.title=='Обновлено' and e.owner==a
 
 
 def test_checklist_each_and_set_not_toggle(people):

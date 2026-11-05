@@ -31,6 +31,7 @@ from .queue import enqueue
 from . import services
 from .chat_memory import read_chat_history, remember_turn
 from .telegram_format import render_markdown, render_plain
+from .addressbook_bot import HELP as ADDRESSBOOK_HELP
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ HELP = """Семейный ассистент · команды
 /repeat — примеры повторений.
 При подключённом ИИ напишите, например, «Поставь нам с супругой спектакль 13 ноября в 16:00 на два часа». Режим работы показывает /agent. Любой из вас может добавить событие сразу для двоих.
 Даты команд — в вашем часовом поясе. Для события на двоих укажите shared и перечислите оба Telegram ID в шестом поле /event. Для /trip участники указываются в пятом поле. /call имеет формат /event и создаёт Meet при подключённом Google.
-"""
+""" + '\n' + ADDRESSBOOK_HELP
 
 SETTINGS_HELP = """Настройки меняются в личном чате:
 /settings timezone Europe/Moscow
@@ -118,8 +119,8 @@ def _parts(text):
 def _command(text):
     if not text.startswith('/'):
         return '', text
-    name, _, args = text.partition(' ')
-    return name.split('@', 1)[0].lower(), args.strip()
+    fields = text.split(maxsplit=1)
+    return fields[0].split('@', 1)[0].lower(), fields[1].strip() if len(fields) == 2 else ''
 
 
 def telegram_attachment_parts(message):
@@ -263,6 +264,9 @@ def _checklist_reply(checklist, person, shared=False, page=0):
 
 
 def _card(kind, identifier, person, shared=False):
+    if kind in {'place', 'contact'}:
+        from .addressbook_bot import card
+        return card(person, kind, identifier, shared)
     obj = services.get_entity(kind, identifier, person, shared_context=shared)
     if kind == 'checklist':
         return _checklist_reply(obj, person, shared)
@@ -391,7 +395,7 @@ def _action_result(result, person, shared):
 def _repeat(person, args, shared):
     from .recurrence import create_rule_from_event, create_rule_from_task
     parts = _parts(args)
-    example = '/repeat task ID | after 1 month\n/repeat event ID | FREQ=WEEKLY;BYDAY=MO\n/repeat event ID | cycle 1,1,0,0\n/repeat task ID | FREQ=MONTHLY;BYMONTHDAY=1\nСовместные серии пока не поддерживаются.'
+    example = '/repeat task ID | after 1 month\n/repeat event ID | FREQ=WEEKLY;BYDAY=MO\n/repeat event ID | cycle 1,1,0,0\n/repeat task ID | FREQ=MONTHLY;BYMONTHDAY=1\nДля совместного события на двоих повторение может настроить любой из вас.'
     if len(parts) != 2 or len(parts[0].split()) != 2:
         return _result(example)
     kind, identifier = parts[0].split()
@@ -522,6 +526,9 @@ def dispatch_command(person, chat_id, text, shared=False):
     command, args = _command(text)
     if command in {'/start','/help'}:
         return _result(HELP)
+    from .addressbook_bot import COMMANDS as ADDRESSBOOK_COMMANDS, dispatch as addressbook_dispatch
+    if command in ADDRESSBOOK_COMMANDS:
+        return addressbook_dispatch(person, command, args, shared)
     if command == '/id':
         return _result(f'Ваш Telegram ID: {person.telegram_id}\nID чата: {chat_id}')
     if command == '/agent':
@@ -570,7 +577,10 @@ def dispatch_command(person, chat_id, text, shared=False):
         obj=services.create_trip(person,title=p[0],starts_on=date.fromisoformat(p[1]),ends_on=date.fromisoformat(p[2]),visibility=_visibility(p[3] if len(p)>3 else '',shared),participants=_participant_ids(p[4]) if len(p)>4 else None,**_link_fields(p,[(5,'project')],person,shared))
         return _card('trip',obj.pk,person,shared)
     if command == '/show':
-        kind, identifier = args.split(maxsplit=1)
+        fields = args.split()
+        if len(fields) != 2 or fields[0] not in {*MODEL_BY_KIND, 'place', 'contact'}:
+            raise ValueError('/show task|event|project|trip|document|checklist|place|contact ID — укажите тип записи и её ID.')
+        kind, identifier = fields
         return _card(kind,identifier,person,shared)
     if command == '/share':
         if shared:
@@ -850,9 +860,12 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
         data=prepared['upload']
         attach_args, caption = telegram_attachment_parts(message)
         if attach_args is not None:
-            kind,identifier=attach_args.split(maxsplit=1)
+            fields = attach_args.split()
+            if len(fields) != 2 or fields[0] not in {'event','trip','task'}:
+                raise ValueError('/attach event|trip|task ID — укажите тип записи и её ID в первой строке подписи.')
+            kind,identifier=fields
             parent=services.get_entity(kind,identifier,person,shared_context=shared)
-            if kind not in {'event','trip','task'} or not services.can_edit(parent,person):
+            if not services.can_edit(parent,person):
                 raise PermissionDenied('Для привязки файла нужны права редактора записи.')
         document=services.save_document(person,data['filename'],data['content'],data['mime_type'],
                                         telegram_file_id=data['file_id'],telegram_caption=caption,
@@ -886,7 +899,14 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
                 reply['format_markdown'] = True
     else:
         text=(prepared or {}).get('text') or message.get('text','')
-        reply=dispatch_command(person,chat_id,text,shared)
+        from .addressbook_bot import location_hint, save_telegram_location
+        command, args = _command(text)
+        if command == '/saveplace':
+            reply=save_telegram_location(person,args,message,shared)
+        elif not text and location_hint(message,shared):
+            reply=location_hint(message,shared)
+        else:
+            reply=dispatch_command(person,chat_id,text,shared)
         if reply is None:
             reply=_result('Для свободного текста настройте LLM_API_KEY и LLM_MODEL. Команды доступны через /help.')
     if person and not callback:
@@ -950,7 +970,8 @@ async def process_update(payload):
             try:
                 if getattr(settings,'AGENT_ENABLED',True):
                     from .agent.runner import run_agent
-                    reply=await run_agent(person_id=person.pk,text=text,chat_id=chat_id,
+                    from .addressbook_bot import with_reply_location
+                    reply=await run_agent(person_id=person.pk,text=with_reply_location(text,message),chat_id=chat_id,
                                           update_id=payload['update_id'],shared_context=shared)
                     # Runner output is a plain answer, not a transport command.
                     # Destination, identity, files and buttons stay code-owned.

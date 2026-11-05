@@ -156,7 +156,7 @@ class AgentContext:
         async with self._lock:
             await sync_to_async(self._reserve)(external)
             body=json.dumps({'name':name,'args':_json(args)},sort_keys=True,ensure_ascii=False)
-            if mutation and name=='set_checklist_item':
+            if mutation and name in ('set_checklist_item','set_place_alias'):
                 # True→false→true is legitimate within one plan. This setter is
                 # idempotent itself; only an exact SDK call replay is cached.
                 body+=':'+str(call_id or uuid.uuid4())

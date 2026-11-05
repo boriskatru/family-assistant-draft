@@ -366,6 +366,17 @@ def search_places(query,language='ru'):
         return _error('google_maps','provider_error','Не удалось найти места. Проверьте ключ, Places API (New), billing и формулировку адреса.')
 
 
+def _route_waypoint(value):
+    # Stored coordinates must reach Routes as coordinates, not a geocoding query.
+    pair = re.fullmatch(r'\s*([+-]?\d+(?:\.\d+)?)\s*,\s*([+-]?\d+(?:\.\d+)?)\s*', value)
+    if pair:
+        latitude, longitude = map(float, pair.groups())
+        if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
+            raise ValueError('Coordinates out of range')
+        return {'location': {'latLng': {'latitude': latitude, 'longitude': longitude}}}
+    return {'address': value}
+
+
 def route_between(origin,destination,mode='DRIVE',departure_time=None):
     """Compute a route using Google Routes API. Times are estimates, not promises."""
     key=str(getattr(settings,'GOOGLE_MAPS_API_KEY','') or '').strip()
@@ -373,7 +384,7 @@ def route_between(origin,destination,mode='DRIVE',departure_time=None):
     try:
         origin=_query(origin,500);destination=_query(destination,500)
         if mode not in {'DRIVE','WALK','BICYCLE','TRANSIT'}:raise ValueError()
-        payload={'origin':{'address':origin},'destination':{'address':destination},'travelMode':mode,
+        payload={'origin':_route_waypoint(origin),'destination':_route_waypoint(destination),'travelMode':mode,
                  'computeAlternativeRoutes':False,'languageCode':'ru','units':'METRIC'}
         if mode=='DRIVE':payload['routingPreference']='TRAFFIC_AWARE'
         if departure_time:

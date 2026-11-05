@@ -3,7 +3,7 @@ import hashlib
 import io
 import re
 import uuid
-from datetime import datetime, timedelta, time
+from datetime import UTC, datetime, timedelta, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from django.conf import settings
@@ -15,10 +15,13 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
 from django.utils.text import get_valid_filename
 from .models import (Person,Project,Trip,Task,Event,Document,Checklist,ChecklistItem,Reminder,
-                     ActionRequest,AuditLog,RecurrenceRule,OccurrenceOverride,TripSegment)
+                     ActionRequest,AuditLog,RecurrenceRule,OccurrenceOverride,TripSegment,Place,Contact)
 from .queue import enqueue
+from .reminder_defaults import event_reminder_minutes
+from .place_links import prepare_segment_places
 
-ENTITY_MODELS={'project':Project,'trip':Trip,'task':Task,'event':Event,'document':Document,'checklist':Checklist}
+ENTITY_MODELS={'project':Project,'trip':Trip,'task':Task,'event':Event,'document':Document,'checklist':Checklist,
+               'place':Place,'contact':Contact}
 
 
 def visible(qs,user,shared_context=False,include_busy=False):
@@ -39,8 +42,12 @@ def can_view(obj,user,shared_context=False):
 def can_edit(obj,user):
     if isinstance(obj,Checklist): obj=obj.parent
     if isinstance(obj,ChecklistItem): obj=obj.checklist.parent
+    if user.telegram_id not in settings.ALLOWED_TELEGRAM_IDS: return False
     if obj.owner_id==user.id: return True
     if obj.visibility!='shared': return False
+    # Shared family events/trips belong to both spouses for editing purposes.
+    # Resolve this at access time so existing records and checklists work too.
+    if isinstance(obj,(Event,Trip,Place,Contact)): return True
     return obj.editors.filter(pk=user.pk).exists() or (isinstance(obj,Task) and obj.assignee_id==user.id)
 
 
@@ -183,8 +190,11 @@ def _request(user,event,changes,kind='update_event'):
 
 
 @transaction.atomic
-def create_event(user,**data):
+def create_event(user,shared_context=False,**data):
     base=_base(user,data,True)
+    from .place_links import event_place_fields
+    place_fields=event_place_fields(user,data,base['visibility'],shared_context)
+    data={**data,**place_fields}
     start=_dt(data.get('starts_at'),user,True,data.get('timezone')); end=_dt(data.get('ends_at'),user,True,data.get('end_timezone') or data.get('timezone'))
     if end<=start: raise ValidationError('Конец должен быть позже начала')
     people=_people(data.get('participants'),user)
@@ -196,9 +206,14 @@ def create_event(user,**data):
     tz=data.get('timezone',user.timezone); endtz=data.get('end_timezone',tz)
     try: ZoneInfo(tz);ZoneInfo(endtz)
     except Exception: raise ValidationError('Неизвестный часовой пояс IANA')
-    minutes=[int(x) for x in data.get('remind_minutes',[15])]
-    if any(not 0<=x<=525600 for x in minutes): raise ValidationError('Некорректный интервал напоминания')
-    obj=Event.objects.create(**base,**_linked(data,user),starts_at=start,ends_at=end,timezone=tz,end_timezone=endtz,location=str(data.get('location',''))[:500],kind=data.get('kind','meeting'),flexible=bool(data.get('flexible',False)),buffer_before=max(0,int(data.get('buffer_before',0))),buffer_after=max(0,int(data.get('buffer_after',0))),meeting_url=data.get('meeting_url',''),all_day=bool(data.get('all_day',False)),start_date=data.get('start_date') or None,end_date=data.get('end_date') or None)
+    obj=Event.objects.create(**base,**_linked(data,user),starts_at=start,ends_at=end,timezone=tz,end_timezone=endtz,location=str(data.get('location',''))[:500],kind='call' if data.get('meeting') else data.get('kind','meeting'),flexible=bool(data.get('flexible',False)),buffer_before=max(0,int(data.get('buffer_before',0))),buffer_after=max(0,int(data.get('buffer_after',0))),meeting_url=data.get('meeting_url',''),all_day=bool(data.get('all_day',False)),start_date=data.get('start_date') or None,end_date=data.get('end_date') or None)
+    if data.get('place_id'):
+        obj.place_id=data['place_id'];obj.place_snapshot=data['place_snapshot']
+        obj.save(update_fields=['place','place_snapshot'])
+    offsets = data.get('remind_minutes')
+    minutes = [event_reminder_minutes(obj)] if offsets is None else [int(x) for x in offsets]
+    if any(not 0 <= x <= 525600 for x in minutes):
+        raise ValidationError('Некорректный интервал напоминания')
     obj.participants.set(people)
     # Either attendee can book for both. A booking solely for someone else
     # still requires that person's agreement.
@@ -208,7 +223,9 @@ def create_event(user,**data):
         _request(user, obj, {'status': 'confirmed'}, 'confirm_event')
     for person in people:
         for offset in sorted(set(minutes)):
-            Reminder.objects.create(event=obj,recipient=person,due_at=start-timedelta(minutes=offset),offset_minutes=offset,object_version=obj.version,status='pending' if obj.status=='confirmed' else 'paused')
+            Reminder.objects.create(event=obj, recipient=person, due_at=start.astimezone(UTC)-timedelta(minutes=offset),
+                                    kind='custom' if offsets is not None else 'reminder', offset_minutes=offset,
+                                    object_version=obj.version, status='pending' if obj.status=='confirmed' else 'paused')
         if obj.status == 'confirmed' and person != user and person.chat_id:
             local_start = start.astimezone(ZoneInfo(person.timezone))
             enqueue('telegram_send', {
@@ -219,7 +236,6 @@ def create_event(user,**data):
                 'permission_refs': [{'kind': 'event', 'id': str(obj.pk)}],
             }, f'joint-event:{obj.pk}:{person.pk}', queue='notifications')
     if data.get('checklist'): make_checklist(user,'event',obj.id,', '.join(data['checklist']) if isinstance(data['checklist'],list) else data['checklist'])
-    if data.get('meeting'): obj.kind='call';obj.save(update_fields=['kind'])
     if obj.status=='confirmed':
         enqueue('google_event',{'event_id':str(obj.id),'create_meet':bool(data.get('meeting'))},f'google:{obj.id}:v{obj.version}')
     _audit(user,obj,'create');return obj
@@ -240,9 +256,11 @@ def reschedule_event(event):
 
 
 def _apply_event(user,event,changes):
-    allowed={'title','description','starts_at','ends_at','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after'}
+    from .place_links import validate_event_place
+    allowed={'title','description','starts_at','ends_at','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot'}
     if set(changes)-allowed: raise ValidationError('Недопустимые поля изменения')
-    before={k:getattr(event,k).isoformat() if isinstance(getattr(event,k),datetime) else getattr(event,k) for k in changes}
+    validate_event_place(user,event,changes)
+    before={k:(getattr(event,k).isoformat() if isinstance(getattr(event,k),datetime) else str(getattr(event,k)) if isinstance(getattr(event,k),uuid.UUID) else getattr(event,k)) for k in changes}
     for k,value in changes.items():
         if k in ('starts_at','ends_at'):value=_dt(value,user,True)
         if k=='visibility' and value not in ('private','shared','busy_only'):raise ValidationError('Некорректная видимость')
@@ -259,11 +277,15 @@ def _apply_event(user,event,changes):
 
 
 @transaction.atomic
-def update_event(user,event_id,changes,expected_version=None):
+def update_event(user,event_id,changes,expected_version=None,shared_context=False):
     event=Event.objects.select_for_update().get(pk=event_id)
     if not can_edit(event,user): raise PermissionDenied('Нет прав на изменение')
     if expected_version is not None and event.version!=expected_version:raise ValidationError('Запись уже изменилась, откройте её заново')
-    safe_changes={k:v.isoformat() if isinstance(v,datetime) else v for k,v in changes.items()}
+    if 'place_snapshot' in changes:raise ValidationError('Адрес выбирается по place_id, снимок формируется приложением.')
+    from .place_links import event_place_fields,validate_event_place
+    safe_changes={k:v.isoformat() if isinstance(v,datetime) else str(v) if isinstance(v,uuid.UUID) else v for k,v in changes.items()}
+    safe_changes.update(event_place_fields(user,changes,changes.get('visibility',event.visibility),shared_context))
+    validate_event_place(user,event,safe_changes)
     req=_request(user,event,safe_changes)
     return req or _apply_event(user,event,safe_changes)
 
@@ -276,6 +298,8 @@ def approve_action(user,request_id,approve=True):
     if req.status!='proposed':return event
     if req.expires_at<timezone.now():req.status='expired';req.save();raise ValidationError('Срок согласования истёк')
     if event.version!=req.target_version:raise ValidationError('Событие изменилось; запросите новое согласование')
+    if approve and not can_edit(event,req.initiator):
+        raise PermissionDenied('Права автора запроса на изменение события отозваны.')
     req.status='applied' if approve else 'rejected';req.save()
     if approve:
         _apply_event(req.initiator,event,req.changes)
@@ -384,6 +408,10 @@ def share_entity(user,kind,identifier,visibility):
     obj=get_entity(kind,identifier,user)
     obj=type(obj).objects.select_for_update().get(pk=obj.pk)
     if obj.owner_id!=user.id:raise PermissionDenied('Видимость меняет только владелец')
+    if kind in ('place','contact'):
+        from .addressbook import save_place,save_contact
+        return (save_place if kind=='place' else save_contact)(user,{
+            'id':obj.pk,'expected_version':obj.version,'visibility':visibility})
     allowed=('private','shared','busy_only') if kind in ('event','trip') else ('private','shared')
     if visibility not in allowed:raise ValidationError('Недопустимый режим видимости')
     if kind=='event':return update_event(user,obj.id,{'visibility':visibility},obj.version)
@@ -420,14 +448,14 @@ def execute_action(user,action,shared_context=False):
         if args.get('visibility','shared')!='shared':raise PermissionDenied('Личные записи создавайте в личном чате')
         args['visibility']='shared'
     if shared_context:
-        for key,kind in [('project_id','project'),('trip_id','trip'),('task_id','task'),('event_id','event'),('document_id','document')]:
+        for key,kind in [('project_id','project'),('trip_id','trip'),('task_id','task'),('event_id','event'),('document_id','document'),('place_id','place')]:
             if args.get(key):get_entity(kind,args[key],user,True)
     creates={'create_project':('project',create_project),'create_trip':('trip',create_trip),'create_task':('task',create_task),'create_event':('event',create_event)}
     if name in creates:
-        kind,fn=creates[name];obj=fn(user,**args)
+        kind,fn=creates[name];obj=fn(user,**args,**({'shared_context':shared_context} if kind=='event' else {}))
         return {'text':f'Сохранено: {obj.title}\nID: {obj.id}'+ ('\nОжидается согласование второго участника.' if getattr(obj,'status','')=='proposed' else ''),'entity_type':kind,'entity_id':str(obj.id)}
     if name=='update_event':
-        obj=update_event(user,args['event_id'],args.get('changes',{}),args.get('expected_version'))
+        obj=update_event(user,args['event_id'],args.get('changes',{}),args.get('expected_version'),shared_context)
         if isinstance(obj,ActionRequest):return {'text':'Отправлено на согласование. До подтверждения событие не меняется.','request_id':str(obj.id)}
         return {'text':f'Событие обновлено: {obj.title}','entity_type':'event','entity_id':str(obj.id)}
     if name=='complete_task':

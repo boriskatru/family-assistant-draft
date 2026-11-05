@@ -95,6 +95,11 @@ LLM_STRUCTURED_MAX_OUTPUT_TOKENS = _positive_integer('LLM_STRUCTURED_MAX_OUTPUT_
 AGENT_HISTORY_USER_LIMIT = _positive_integer('AGENT_HISTORY_USER_LIMIT', 50)
 if AGENT_HISTORY_USER_LIMIT > 50:
     raise RuntimeError('AGENT_HISTORY_USER_LIMIT must be between 1 and 50')
+# Empty disables the optional server-managed family profile. Missing/empty
+# files also leave the built-in instructions unchanged.
+PERSONAL_CONTEXT_FILE = os.getenv('PERSONAL_CONTEXT_FILE', str(BASE_DIR/'private'/'personal_context.md')).strip()
+PERSONAL_CONTEXT_MAX_CHARS = _positive_integer('PERSONAL_CONTEXT_MAX_CHARS', 20000)
+PERSONAL_CONTEXT_IN_GROUPS = os.getenv('PERSONAL_CONTEXT_IN_GROUPS', '0') == '1'
 SECURE_PROXY_SSL_HEADER=('HTTP_X_FORWARDED_PROTO','https')
 SECURE_CONTENT_TYPE_NOSNIFF=True
 X_FRAME_OPTIONS='DENY'

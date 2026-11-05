@@ -9,6 +9,7 @@ x-app: &app
     MEDIA_ROOT: /data/media
   volumes:
     - media_data:/data
+    - ./private:/app/private:ro
   restart: unless-stopped
   init: true
   security_opt:

@@ -19,7 +19,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from assistant.models import Checklist, Document, Event, Person, Project, Task, Trip
-from assistant.services import can_view, get_entity, safe_event, visible
+from assistant.services import can_edit, can_view, get_entity, safe_event, visible
 
 MODELS = {'event': Event, 'task': Task, 'project': Project, 'trip': Trip, 'document': Document}
 MAX_DOCUMENT_PAGES = 200
@@ -171,6 +171,9 @@ def read_record(user, kind, record_id, shared_context=False):
     else:
         data = _summary(kind, obj, user, shared_context)
         data.update(description=obj.description[:10000], domain=obj.domain, owner_id=str(obj.owner_id))
+        if kind == 'event':
+            data['place_id'] = str(obj.place_id) if obj.place_id else None
+            data['place_snapshot'] = obj.place_snapshot
         if hasattr(obj, 'participants'):
             data['participants'] = [{'id': str(p.pk), 'name': p.name} for p in obj.participants.filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS)]
         for parent_kind in ('project', 'trip', 'task'):
@@ -216,6 +219,9 @@ def read_record(user, kind, record_id, shared_context=False):
                 if can_view(segment.event, user, shared_context):
                     data['segments'].append({'id': str(segment.pk), 'event': _summary('event', segment.event, user, shared_context),
                                              'origin': segment.origin, 'destination': segment.destination,
+                                             'origin_place_id': str(segment.origin_place_id) if segment.origin_place_id else None,
+                                             'destination_place_id': str(segment.destination_place_id) if segment.destination_place_id else None,
+                                             'origin_snapshot': segment.origin_snapshot, 'destination_snapshot': segment.destination_snapshot,
                                              'booking_status': segment.booking_status, 'carrier': segment.carrier,
                                              'flight_number': segment.flight_number, 'booking_reference': segment.booking_reference,
                                              'checkin_minutes': segment.checkin_minutes, 'baggage_minutes': segment.baggage_minutes,
@@ -240,6 +246,7 @@ def read_record(user, kind, record_id, shared_context=False):
                 data['metadata'] = metadata
             else:
                 data.update(metadata_excerpt=metadata_text[:16000], metadata_truncated=True)
+    data['can_edit'] = can_edit(obj, user)
     return {'record': data, 'permission_refs': refs, 'sources': [_source(kind, obj)], 'untrusted_content': True}
 
 

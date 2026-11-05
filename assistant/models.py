@@ -54,6 +54,50 @@ class Trip(Owned):
     participants = models.ManyToManyField(Person, blank=True, related_name='trips')
 
 
+class Contact(Owned):
+    """Address-book contacts have no bot account or application permissions."""
+    kind = models.CharField(max_length=20, default='person', choices=[('person','Человек'),('organization','Организация')])
+    phone = models.CharField(max_length=100, blank=True)
+    email = models.EmailField(blank=True)
+    relationship = models.CharField(max_length=300, blank=True)
+    aliases = models.JSONField(default=list, blank=True)
+    search_text = models.TextField(blank=True, editable=False)
+    projects = models.ManyToManyField(Project, blank=True, related_name='contacts')
+
+
+class Place(Owned):
+    category = models.CharField(max_length=64, default='other')
+    address = models.CharField(max_length=500, blank=True)
+    address_confirmed = models.BooleanField(default=False)
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    map_url = models.URLField(max_length=2000, blank=True)
+    access_notes = models.TextField(blank=True)
+    parking_notes = models.TextField(blank=True)
+    aliases = models.JSONField(default=list, blank=True)
+    search_text = models.TextField(blank=True, editable=False)
+    contacts = models.ManyToManyField(Contact, blank=True, related_name='places')
+    projects = models.ManyToManyField(Project, blank=True, related_name='places')
+
+    class Meta:
+        constraints = [models.CheckConstraint(
+            condition=Q(latitude__isnull=True,longitude__isnull=True) |
+                      Q(latitude__isnull=False,longitude__isnull=False,
+                        latitude__gte=-90,latitude__lte=90,longitude__gte=-180,longitude__lte=180),
+            name='place_coordinates_pair_and_range')]
+
+
+class PlaceAlias(Base):
+    """A user's contextual name: each spouse may mean a different 'мама'."""
+    owner = models.ForeignKey(Person, on_delete=models.CASCADE, related_name='place_aliases')
+    place = models.ForeignKey(Place, on_delete=models.CASCADE, related_name='personal_aliases')
+    alias = models.CharField(max_length=100)
+    normalized = models.CharField(max_length=100, db_index=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['owner','place','normalized'], name='unique_person_place_alias')]
+
+
 class RecurrenceRule(Owned):
     kind = models.CharField(max_length=10, default='event')
     mode = models.CharField(max_length=20, default='calendar')
@@ -104,6 +148,8 @@ class Event(Owned):
     start_date = models.DateField(null=True, blank=True)
     end_date = models.DateField(null=True, blank=True)
     location = models.CharField(max_length=500, blank=True)
+    place = models.ForeignKey(Place, null=True, blank=True, on_delete=models.SET_NULL, related_name='events')
+    place_snapshot = models.JSONField(default=dict, blank=True)
     kind = models.CharField(max_length=30, default='meeting')
     status = models.CharField(max_length=20, default='confirmed')
     flexible = models.BooleanField(default=False)
@@ -134,6 +180,10 @@ class TripSegment(Base):
     kind = models.CharField(max_length=20, default='transport')
     origin = models.CharField(max_length=500, blank=True)
     destination = models.CharField(max_length=500, blank=True)
+    origin_place = models.ForeignKey(Place, null=True, blank=True, on_delete=models.SET_NULL, related_name='departing_segments')
+    destination_place = models.ForeignKey(Place, null=True, blank=True, on_delete=models.SET_NULL, related_name='arriving_segments')
+    origin_snapshot = models.JSONField(default=dict, blank=True)
+    destination_snapshot = models.JSONField(default=dict, blank=True)
     booking_status = models.CharField(max_length=20, default='planned')
     booking_reference = models.CharField(max_length=200, blank=True)
     carrier = models.CharField(max_length=200, blank=True)
