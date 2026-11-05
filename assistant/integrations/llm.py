@@ -10,7 +10,7 @@ import io
 import json
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 from django.conf import settings
 from django.utils import timezone
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, WithJsonSchema, field_validator, model_validator
 
 
 class LLMError(RuntimeError):
@@ -96,6 +96,15 @@ class TaskArgs(CommonCreate):
         return self
 
 
+# HttpUrl validates HTTP(S), host and URL length at execution time. Its default
+# JSON Schema emits format="uri", which OpenAI strict tool schemas do not accept.
+# Override only the advertised schema; retain HttpUrl and public_link validation.
+# https://developers.openai.com/api/docs/guides/structured-outputs#supported-schemas
+MeetingUrl = Annotated[HttpUrl, WithJsonSchema({
+    'type': 'string', 'pattern': '^https?://', 'minLength': 1, 'maxLength': 2000,
+})]
+
+
 class EventArgs(CommonCreate):
     starts_at: datetime
     ends_at: datetime
@@ -115,7 +124,7 @@ class EventArgs(CommonCreate):
         'Use null for the normal reminder. Set [] only if the user explicitly disables reminders, '
         'or supply offsets in minutes if requested.'))
     meeting: bool = False
-    meeting_url: HttpUrl | None = Field(default=None, max_length=2000, description=(
+    meeting_url: MeetingUrl | None = Field(default=None, max_length=2000, description=(
         'An existing HTTP(S) call link supplied by the user or read from an authorized record.'))
     checklist: list[str] = Field(default_factory=list, max_length=100)
 
