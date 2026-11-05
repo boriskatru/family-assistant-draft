@@ -840,7 +840,11 @@ def _finish_sync(payload,identity,person_id,prepared=None):
         except (ValueError,ValidationError,PermissionDenied,ZoneInfoNotFoundError) as exc:
             error=' '.join(exc.messages) if isinstance(exc,ValidationError) else str(exc)
             _queue_reply(incoming.update_id,chat_id,_result(error[:3000] or 'Нет доступа или неверный формат.'),person,shared)
-        except (KeyError,TypeError,IndexError,Person.DoesNotExist,ChecklistItem.DoesNotExist,Conversation.DoesNotExist):
+        except (KeyError,TypeError,IndexError) as exc:
+            from .error_reporting import report_error
+            error_id=report_error(exc,'bot.command')
+            _queue_reply(incoming.update_id,chat_id,_result(f'Не удалось обработать команду. Код ошибки: {error_id}. /help — примеры.'),person,shared)
+        except (Person.DoesNotExist,ChecklistItem.DoesNotExist,Conversation.DoesNotExist):
             _queue_reply(incoming.update_id,chat_id,_result('Запись не найдена, кнопка устарела или формат неверен. /help — примеры.'),person,shared)
         incoming.status='completed'
         incoming.payload={**incoming.payload,'_bot_processed':True}
@@ -964,8 +968,9 @@ async def process_update(payload):
                         metadata=await sync_to_async(extract_document,thread_sensitive=False)(content,mime,filename)
                         prepared={'upload':{'filename':Path(filename).name,'content':content,'mime_type':mime,'file_id':attachment['file_id'],'metadata':metadata}}
                 except Exception as exc:
-                    log.warning('Attachment preparation failed: %s',type(exc).__name__)
-                    prepared={'error':'Не удалось получить файл или распознать голос. Проверьте настройки API либо пришлите текст.'}
+                    from .error_reporting import report_error
+                    error_id=await sync_to_async(report_error)(exc,'bot.attachment')
+                    prepared={'error':f'Не удалось получить или распознать вложение. Код ошибки: {error_id}. Можно прислать текст.'}
         if prepared is None and text and not text.startswith('/'):
             try:
                 if getattr(settings,'AGENT_ENABLED',True):
@@ -988,11 +993,12 @@ async def process_update(payload):
                         action['permission_refs'] = [*action.get('permission_refs', []), *guards]
                     prepared={'action':action,'text':text}
             except Exception as exc:
-                log.warning('Language interpretation failed: %s',type(exc).__name__)
+                from .error_reporting import report_error
+                error_id=await sync_to_async(report_error)(exc,'bot.interpret')
                 if getattr(settings,'AGENT_ENABLED',True):
-                    prepared={'error':'Работа агента прервана. Уже выполненные действия могли сохраниться: проверьте /agent_history и нужные записи. Команды из /help доступны без ИИ.'}
+                    prepared={'error':f'Работа агента прервана. Код ошибки: {error_id}. Уже выполненные действия могли сохраниться: проверьте /agent_history и нужные записи. Команды из /help доступны без ИИ.'}
                 else:
-                    prepared={'error':'Не удалось обработать свободный текст. Проверьте настройки LLM; команды из /help доступны без него.'}
+                    prepared={'error':f'Не удалось обработать свободный текст. Код ошибки: {error_id}. Команды из /help доступны без ИИ.'}
         elif prepared is None and text:
             if _command(text)[0] in {'/google','/calendars','/calendar','/resolve'}:
                 # OAuth refresh and Google sync may perform HTTP and persist token state.
@@ -1033,5 +1039,6 @@ async def poll_forever():
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning('Polling retry: stage=%s update_id=%s error=%s', stage, update_id, type(exc).__name__)
+                from .error_reporting import report_error
+                await sync_to_async(report_error)(exc,'bot.poll.'+stage)
                 await asyncio.sleep(3)

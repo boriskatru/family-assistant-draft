@@ -178,7 +178,9 @@ class AgentContext:
                 result={'ok':False,'error':message[:1500],'error_type':type(exc).__name__}
                 await sync_to_async(self._record)(name,args,result,fingerprint,mutation,'error',type(exc).__name__)
             except Exception as exc:
-                result={'ok':False,'error':'Инструмент временно недоступен. Не утверждайте, что действие выполнено.','error_type':type(exc).__name__}
+                from assistant.error_reporting import report_error
+                error_id=await sync_to_async(report_error)(exc,'agent.tool',run_id=self.run.pk)
+                result={'ok':False,'error':f'Инструмент временно недоступен. Код ошибки: {error_id}. Не утверждайте, что действие выполнено.','error_type':type(exc).__name__}
                 await sync_to_async(self._record)(name,args,result,fingerprint,mutation,'error',type(exc).__name__)
             result=_json(result)
             self._egress.observe(result)

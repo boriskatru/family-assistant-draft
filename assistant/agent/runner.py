@@ -35,6 +35,7 @@ from assistant.integrations.llm import (
 from assistant.addressbook_schemas import ContactArgs, PlaceArgs
 from .prompts import SYSTEM_INSTRUCTIONS
 from .context import AgentInterrupted, AgentLimitExceeded
+from assistant.error_reporting import report_error
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +47,12 @@ _trace_provider.set_disabled(True)
 set_trace_provider(_trace_provider)
 
 
-def _tool_failure(wrapper,error):
+async def _tool_failure(wrapper,error):
     if isinstance(error,(AgentInterrupted,AgentLimitExceeded,AgentBudgetExceeded)):
         raise error
-    return 'Некорректные аргументы инструмента. Проверьте схему и исправьте запрос; выполнение не подтверждено.'
+    run=getattr(getattr(wrapper,'context',None),'run',None)
+    error_id=await sync_to_async(report_error)(error,'agent.tool_arguments',run_id=getattr(run,'pk',None))
+    return f'Некорректные аргументы инструмента. Код ошибки: {error_id}. Проверьте схему и исправьте запрос; выполнение не подтверждено.'
 
 
 def function_tool(func):
@@ -397,6 +400,7 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
     if getattr(ctx.run,'final_reply',None):
         return ctx.run.final_reply
     client=None
+    stage='agent.prepare'
     try:
         cache_breakpoints = False
         if model is None:
@@ -405,13 +409,16 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
             client=AsyncOpenAI(api_key=key,base_url=base,max_retries=0,
                 http_client=httpx.AsyncClient(timeout=httpx.Timeout(55,connect=10),follow_redirects=False,trust_env=False))
             model=OpenAIResponsesModel(model=model_name,openai_client=client)
+        stage='agent.reference'
         live_reference = reference is None
         if live_reference:
             reference = await sync_to_async(_input_reference)(ctx)
         # REST supports both TTLs; the pinned SDK's typed field only accepts 30m.
         cache_options = {'mode': 'implicit', 'ttl': settings.LLM_PROMPT_CACHE_TTL}
+        stage='agent.profile'
         from assistant.personal_context import build_instructions
         instructions = await sync_to_async(build_instructions)(SYSTEM_INSTRUCTIONS, getattr(ctx,'shared_context',False))
+        stage='agent.tools'
         agent=Agent(name='Family assistant',instructions=instructions,
                     model=model,tools=build_tools() if tools is None else tools,
                     model_settings=ModelSettings(parallel_tool_calls=False,store=False,
@@ -426,6 +433,7 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
         ]}
         history = []
         if live_reference:
+            stage='agent.history'
             from assistant.chat_memory import history_for_agent
             # Reserve the current turn, tools, instructions and configured output
             # first. Fit recent whole exchanges into the same estimator as BudgetHooks.
@@ -439,32 +447,40 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
         group_id = None
         if getattr(ctx.run, 'person_id', None):
             group_id = f'family-assistant/{ctx.run.person_id}/{ctx.run.chat_id}'
+        stage='agent.run'
         async with asyncio.timeout(settings.AGENT_TIMEOUT_SECONDS):
             result=await Runner.run(agent,inputs,context=ctx,hooks=hooks,
                 max_turns=settings.AGENT_MAX_TURNS,
                 run_config=RunConfig(tracing_disabled=True,trace_include_sensitive_data=False,group_id=group_id,
                     workflow_name='Family assistant',tool_execution=ToolExecutionConfig(max_function_tool_concurrency=1)))
+        stage='agent.checkpoint'
         await ctx.save_checkpoint(_public_checkpoint(result.to_input_list()),hooks.usage)
         answer=str(result.final_output or '').strip()
         if not answer:
             answer='Цикл завершён без итогового ответа. Проверьте выполненные действия ниже.'
         return await ctx.finish('completed',answer)
-    except (MaxTurnsExceeded,AgentBudgetExceeded,AgentLimitExceeded,TimeoutError):
-        return await ctx.finish('limited','Достигнут лимит шагов, времени или токенов. Уже выполненные действия сохранены; незавершённую часть можно поручить отдельным сообщением.\n\n'+await ctx.partial_summary())
+    except (MaxTurnsExceeded,AgentBudgetExceeded,AgentLimitExceeded,TimeoutError) as exc:
+        error_id=await sync_to_async(report_error)(exc,'agent.limit',run_id=getattr(ctx.run,'pk',None))
+        return await ctx.finish('limited',f'Достигнут лимит шагов, времени или токенов. Код: {error_id}. Уже выполненные действия сохранены; незавершённую часть можно поручить отдельным сообщением.\n\n'+await ctx.partial_summary())
     except AgentInterrupted:
         return await ctx.finish('interrupted','Обработка прервана. Сохранённые результаты:\n'+await ctx.partial_summary())
     except Exception as exc:
         from assistant.personal_context import PersonalContextError
         if isinstance(exc,PersonalContextError):
-            return await ctx.finish('failed',str(exc))
+            error_id=await sync_to_async(report_error)(exc,stage,run_id=getattr(ctx.run,'pk',None))
+            return await ctx.finish('failed',f'{exc}\nКод ошибки: {error_id}.')
         # SDK wraps application exceptions from function tools as UserError,
         # retaining the original cause. Preserve normal hard-limit semantics.
         stop=_stop_cause(exc)
         if stop is not None:
             status='interrupted' if isinstance(stop,AgentInterrupted) else 'limited'
-            return await ctx.finish(status,'Агентский цикл остановлен по лимиту или прерыванию. Сохранённые результаты:\n'+await ctx.partial_summary())
-        logger.warning('Agent run failed (%s)',type(exc).__name__)
-        return await ctx.finish('failed','Не удалось завершить агентский цикл. Уже выполненные действия сохранены. Проверьте настройки API; команды /help продолжают работать.\n\n'+await ctx.partial_summary())
+            suffix=''
+            if status=='limited':
+                error_id=await sync_to_async(report_error)(stop,'agent.limit',run_id=getattr(ctx.run,'pk',None))
+                suffix=f' Код: {error_id}.'
+            return await ctx.finish(status,'Агентский цикл остановлен по лимиту или прерыванию.'+suffix+' Сохранённые результаты:\n'+await ctx.partial_summary())
+        error_id=await sync_to_async(report_error)(exc,stage,run_id=getattr(ctx.run,'pk',None))
+        return await ctx.finish('failed',f'Не удалось завершить агентский цикл. Код ошибки: {error_id}. Уже выполненные действия сохранены; команды /help продолжают работать.\n\n'+await ctx.partial_summary())
     finally:
         if client is not None:
             await client.close()

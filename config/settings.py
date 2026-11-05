@@ -85,6 +85,14 @@ def _positive_integer(name, default):
 
 
 AGENT_MAX_TURNS = _positive_integer('AGENT_MAX_TURNS', 12)
+# Diagnostics go only to this allowed user's registered private chat.
+try:
+    ERROR_ADMIN_TELEGRAM_ID = int(os.getenv('ERROR_ADMIN_TELEGRAM_ID', '') or 0)
+except ValueError:
+    raise RuntimeError('ERROR_ADMIN_TELEGRAM_ID must be one positive user ID or empty') from None
+if ERROR_ADMIN_TELEGRAM_ID < 0 or (ERROR_ADMIN_TELEGRAM_ID and ERROR_ADMIN_TELEGRAM_ID not in ALLOWED_TELEGRAM_IDS):
+    raise RuntimeError('ERROR_ADMIN_TELEGRAM_ID must be a user ID from ALLOWED_TELEGRAM_IDS')
+ERROR_ALERT_COOLDOWN_SECONDS = _positive_integer('ERROR_ALERT_COOLDOWN_SECONDS', 600)
 AGENT_MAX_TOOL_CALLS = _positive_integer('AGENT_MAX_TOOL_CALLS', 24)
 AGENT_MAX_EXTERNAL_CALLS = _positive_integer('AGENT_MAX_EXTERNAL_CALLS', 8)
 AGENT_TIMEOUT_SECONDS = _positive_integer('AGENT_TIMEOUT_SECONDS', 180)

@@ -5,6 +5,7 @@ from django.core.management.base import BaseCommand
 from django.db import close_old_connections
 from assistant.queue import claim,finish,heartbeat
 from assistant.runtime import handle_job
+from assistant.error_reporting import report_error
 logger=logging.getLogger(__name__)
 class Command(BaseCommand):
     help='Process durable database jobs'
@@ -27,7 +28,10 @@ class Command(BaseCommand):
                 handle_job(job);finish(job)
             except Exception as exc:
                 # Exception type only: URLs may contain service credentials or ticket data.
-                logger.error('Job %s kind=%s failed (%s)',job.id,job.kind,type(exc).__name__)
+                if not job.payload.get('error_alert'):
+                    report_error(exc,'worker.'+opts['queue'],job_id=job.pk)
+                else:
+                    logger.error('Error alert delivery failed job=%s error=%s',job.id,type(exc).__name__)
                 finish(job,error=exc)
             finally:
                 stopped.set();thread.join(timeout=2)

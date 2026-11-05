@@ -19,6 +19,12 @@ from .telegram_format import render_plain
 logger=logging.getLogger(__name__)
 
 
+class TelegramRequestError(RuntimeError):
+    def __init__(self, status_code=None):
+        self.status_code = status_code
+        super().__init__('Telegram request failed')
+
+
 def _tg(method, data, files=None):
     if not settings.TELEGRAM_BOT_TOKEN: raise RuntimeError('Telegram is not configured')
     with httpx.Client(timeout=30) as client:
@@ -32,13 +38,17 @@ def _tg(method, data, files=None):
                 ("can't parse entities", "can't parse message text", 'entity_bounds_invalid',
                  'entities_too_long', 'wrong http url', 'unsupported url protocol')):
             return _tg(method, {key: value for key, value in data.items() if key != 'entities'})
-    if response.status_code!=200: raise RuntimeError(f'Telegram request failed ({response.status_code})')
+    if response.status_code!=200: raise TelegramRequestError(response.status_code)
     result=response.json()
-    if not result.get('ok'):raise RuntimeError('Telegram rejected request')
+    if not result.get('ok'):raise TelegramRequestError(result.get('error_code'))
     return result.get('result',{})
 
 
 def send_payload(job,payload):
+    if payload.get('error_alert'):
+        from .error_reporting import may_deliver_alert
+        if not may_deliver_alert(payload):
+            return
     chat_id=int(payload['chat_id'])
     if payload.get('onboarding_id'):
         # Unknown users may request their own ID, never arbitrary text/files.
