@@ -58,10 +58,16 @@ def test_event_updates_require_observed_version_to_prevent_stale_confirmation():
     assert action['args']['expected_version'] == 3
 
 
-def test_group_does_not_create_private_object():
-    action = llm.validate_action(envelope('create_task', {'title': 'Личное'}), shared_context=True)
-    assert action['action'] == 'answer'
-    assert 'личном чате' in action['reply']
+def test_group_accepts_explicit_private_creation_for_sender():
+    action = llm.validate_action(envelope('create_task', {'title': 'Личное', 'visibility': 'private'}), shared_context=True)
+    assert action['action'] == 'create_task'
+    assert action['args']['visibility'] == 'private'
+
+
+def test_group_creation_defaults_to_shared_when_visibility_omitted():
+    action = llm.validate_action(envelope('create_task', {'title': 'Общее'}), shared_context=True)
+    assert action['action'] == 'create_task'
+    assert action['args']['visibility'] == 'shared'
 
 
 def test_coerces_ids_and_dates_to_json_safe_values():

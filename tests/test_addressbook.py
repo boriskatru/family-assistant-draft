@@ -31,29 +31,32 @@ def test_both_spouses_edit_existing_shared_card_without_owner_transfer(people, c
 
 
 @pytest.mark.parametrize('kind,save', [('place', save_place), ('contact', save_contact)])
-def test_private_cards_hidden_from_spouse_group_and_stranger(people, settings, kind, save):
+def test_private_cards_readable_by_owner_in_group_but_not_spouse_or_stranger(people, settings, kind, save):
     owner, spouse = people
     card = save(owner, {'title': 'Секретное место'})
     assert search_addressbook(spouse, kind, 'Секретное')['total'] == 0
-    for viewer, group in [(spouse, False), (owner, True)]:
+    for viewer, group in [(spouse, False), (spouse, True)]:
         with pytest.raises(PermissionDenied):
             read_addressbook(viewer, kind, card.pk, shared_context=group)
         with pytest.raises(PermissionDenied):
             save(viewer, {'id': card.pk, 'expected_version': card.version, 'title': 'Перезаписать'}, shared_context=group)
+    assert read_addressbook(owner, kind, card.pk, shared_context=True)['record']['title'] == card.title
+    changed = save(owner, {'id': card.pk, 'expected_version': card.version, 'title': 'Моя запись'}, shared_context=True)
+    assert changed.title == 'Моя запись' and changed.visibility == 'private'
     settings.ALLOWED_TELEGRAM_IDS = (spouse.telegram_id,)
     with pytest.raises(PermissionDenied):
         search_addressbook(owner, kind)
 
 
-def test_group_creation_shared_default_and_private_visibility_is_rejected(people):
+def test_group_creation_defaults_shared_and_explicit_private_stays_private(people):
     owner, spouse = people
     place = save_place(owner, {'title': 'Офис'}, shared_context=True)
     assert place.visibility == 'shared'
-    with pytest.raises(PermissionDenied):
-        save_place(owner, {'title': 'Личный дом', 'visibility': 'private'}, shared_context=True)
+    private = save_place(owner, {'title': 'Личный дом', 'visibility': 'private'}, shared_context=True)
+    assert private.visibility == 'private' and private.owner == owner
     with pytest.raises(PermissionDenied, match='владелец'):
         save_place(spouse, {'id': place.pk, 'expected_version': place.version, 'visibility': 'private'})
-    assert Place.objects.count() == 1
+    assert Place.objects.count() == 2
 
 
 def test_contact_is_not_a_bot_user_and_place_can_link_company_and_project(people):
@@ -114,7 +117,7 @@ def test_private_alias_target_stays_private_and_common_aliases_unicode_normalize
     set_place_alias(owner, place.pk, 'Дом')
     assert search_addressbook(owner, 'place', 'КОРОЛЕВ')['total'] == 1
     assert search_addressbook(spouse, 'place', 'Дом')['total'] == 0
-    assert search_addressbook(owner, 'place', 'Дом', shared_context=True)['total'] == 0
+    assert search_addressbook(owner, 'place', 'Дом', shared_context=True)['total'] == 1
     with pytest.raises(PermissionDenied):
         set_place_alias(spouse, place.pk, 'Дом')
 

@@ -98,7 +98,6 @@ WRITE_ACTIONS = {
     'complete_task', 'make_checklist',
 }
 MODEL_BY_KIND = {'project': Project, 'task': Task, 'event': Event, 'trip': Trip, 'document': Document, 'checklist': Checklist}
-MAX_UPLOAD = 15 * 1024 * 1024
 
 
 def _group_id():
@@ -164,8 +163,6 @@ def _visibility(value, shared):
     result = value or ('shared' if shared else 'private')
     if result not in {'private', 'shared', 'busy_only'}:
         raise ValueError('Видимость: private, shared или busy_only.')
-    if shared and result != 'shared':
-        raise PermissionDenied('Личные записи создавайте в личном чате.')
     return result
 
 
@@ -636,16 +633,13 @@ def dispatch_command(person, chat_id, text, shared=False):
         doc=services.link_document(person,p[0],p[1],p[2])
         return _result('Файл связан с записью.',**_entity_meta('document',doc))
     if command in {'/today','/plan'}:
-        if shared:
-            raise PermissionDenied('Персональный план доступен в личном чате с ботом.')
         from .planning import render_daily_plan, plan_permission_refs
         day=date.fromisoformat(args) if args else timezone.now().astimezone(ZoneInfo(person.timezone)).date()
         text=render_daily_plan(person,day)
         plan=DailyPlan.objects.get(person=person,day=day)
-        return _result(text,permission_refs=plan_permission_refs(person,day),reply_markup=_markup([[('Принять предложенные блоки',f'plan:{day.isoformat()}:{plan.version}')]]))
+        callback = f'plan:{day.isoformat()}:{plan.version}:{person.pk}' if shared else f'plan:{day.isoformat()}:{plan.version}'
+        return _result(text,permission_refs=plan_permission_refs(person,day),reply_markup=_markup([[('Принять предложенные блоки',callback)]]))
     if command == '/accept':
-        if shared:
-            raise PermissionDenied('План принимается в личном чате.')
         from .planning import accept_plan
         day=date.fromisoformat(args)
         events=accept_plan(person,day)
@@ -745,9 +739,9 @@ def dispatch_callback(person,chat_id,data,shared=False):
         messages = {'applied': 'Изменение согласовано.', 'rejected': 'Предложение отклонено.',
                     'superseded': 'Подтверждение создания больше не требуется. Текущее расписание в /events.'}
         return _result(messages.get(status, 'Запрос на согласование закрыт.'))
-    if operation == 'plan' and len(parts)==3:
-        if shared:
-            raise PermissionDenied('План принимается в личном чате.')
+    if operation == 'plan' and len(parts) in (3,4):
+        if shared and (len(parts)!=4 or parts[3]!=str(person.pk)):
+            raise PermissionDenied('Это кнопка другого пользователя. Откройте свой /plan.')
         from .planning import accept_plan
         day=date.fromisoformat(parts[1])
         plan=DailyPlan.objects.select_for_update().filter(person=person,day=day).first()
@@ -918,6 +912,66 @@ def _handle_prepared(person,user_id,chat_id,shared,message,callback,prepared):
     return reply
 
 
+async def _process_file(payload, person, message, shared, attachment):
+    """Commit the original before recognition; retry resumes the same document/run."""
+    from . import attachments
+    doc, state = await sync_to_async(attachments.saved_upload)(payload['update_id'], person, shared)
+    content = None
+    if doc is None:
+        attach_args, caption = telegram_attachment_parts(message)
+        parent = None
+        if attach_args is not None:
+            fields = attach_args.split()
+            if len(fields) != 2 or fields[0] not in {'event', 'trip', 'task'}:
+                raise ValueError('/attach event|trip|task ID — укажите тип записи и её ID в первой строке подписи.')
+            parent = tuple(fields)
+        async with Bot(settings.TELEGRAM_BOT_TOKEN) as client:
+            file_info = await client.get_file(attachment['file_id'])
+            buf = io.BytesIO()
+            await client.download_file(file_info.file_path, destination=buf, timeout=60)
+            content = buf.getvalue()
+        if len(content) > settings.MAX_UPLOAD_MB * 1024 * 1024:
+            raise ValueError(f'Файл слишком большой. Максимум — {settings.MAX_UPLOAD_MB} МБ.')
+        document = message.get('document') or {}
+        data = {'filename': Path(document.get('file_name') or 'photo.jpg').name,
+                'content': content, 'mime_type': document.get('mime_type') or 'image/jpeg',
+                'file_id': attachment['file_id']}
+        doc, state = await sync_to_async(attachments.persist_upload)(payload, person, data, caption, parent, shared)
+    if not state.get('extraction_done'):
+        if content is None:
+            content = await sync_to_async(attachments.original_bytes)(doc)
+        from .integrations.llm import extract_document
+        try:
+            metadata = await sync_to_async(extract_document, thread_sensitive=False)(
+                content, doc.mime_type, doc.original_name, telegram_caption=doc.telegram_caption)
+        except Exception as exc:
+            from .error_reporting import report_error
+            error_id = await sync_to_async(report_error)(exc, 'bot.attachment_extract')
+            metadata = {'needs_review': True, 'recognition_status': 'failed', 'warnings': [f'Распознавание не завершено. Код ошибки: {error_id}.'],
+                        'extracted_text': doc.extracted_text, 'events': []}
+        doc, state = await sync_to_async(attachments.finish_extraction)(payload['update_id'], person, metadata, shared)
+    text = attachments.request_text(doc, message)
+    if state.get('attach_only'):
+        reply = attachments.receipt(doc, text='Файл связан с указанной записью.')
+    elif not settings.AGENT_ENABLED:
+        reply = attachments.receipt(doc, text='Автоматическая обработка агентом отключена. /show document ' + str(doc.pk))
+    else:
+        from .agent.runner import run_agent
+        try:
+            answer = await run_agent(person_id=person.pk, text=text, chat_id=message['chat']['id'],
+                                     update_id=payload['update_id'], shared_context=shared)
+            if not isinstance(answer, dict) or not isinstance(answer.get('text'), str):
+                raise ValueError('Invalid agent response')
+            reply = attachments.receipt(doc, text=answer['text'], markdown=True)
+            reply['permission_refs'] += answer.get('permission_refs', [])
+        except Exception as exc:
+            from .error_reporting import report_error
+            error_id = await sync_to_async(report_error)(exc, 'bot.attachment_agent')
+            reply = attachments.receipt(doc, text=f'Не удалось завершить обработку. Код ошибки: {error_id}. '
+                                        'Выполненные действия могли сохраниться; проверьте расписание перед повторным запросом.')
+    return {'reply': reply, 'text': text}
+
+
 async def process_update(payload):
     """Process one durable update. Network/LLM outside mutation transaction."""
     identity=_identity(payload)
@@ -945,32 +999,32 @@ async def process_update(payload):
         voice=message.get('voice')
         attachment=document or photo or voice
         if attachment:
-            if shared:
-                prepared={'error':'Билеты, документы и голосовые отправляйте в личный чат с ботом. После сохранения файл можно связать с общей поездкой.'}
-            elif int(attachment.get('file_size') or 0)>MAX_UPLOAD:
-                prepared={'error':'Файл слишком большой. Максимум — 15 МБ.'}
+            if int(attachment.get('file_size') or 0)>settings.MAX_UPLOAD_MB * 1024 * 1024:
+                prepared={'error':f'Файл слишком большой. Максимум — {settings.MAX_UPLOAD_MB} МБ.'}
             else:
                 try:
-                    async with Bot(settings.TELEGRAM_BOT_TOKEN) as bot:
-                        file_info=await bot.get_file(attachment['file_id'])
-                        buf=io.BytesIO()
-                        await bot.download_file(file_info.file_path,destination=buf,timeout=60)
-                        content=buf.getvalue()
-                    if len(content)>MAX_UPLOAD:
-                        raise ValueError('Файл слишком большой. Максимум — 15 МБ.')
-                    filename=(document or {}).get('file_name') or ('voice.ogg' if voice else 'photo.jpg')
-                    mime=(document or voice or {}).get('mime_type') or ('audio/ogg' if voice else 'image/jpeg')
                     if voice:
+                        async with Bot(settings.TELEGRAM_BOT_TOKEN) as client:
+                            file_info=await client.get_file(attachment['file_id'])
+                            buf=io.BytesIO()
+                            await client.download_file(file_info.file_path,destination=buf,timeout=60)
+                            content=buf.getvalue()
+                        if len(content)>settings.MAX_UPLOAD_MB * 1024 * 1024:
+                            raise ValueError('Файл слишком большой.')
                         from .integrations.llm import transcribe
-                        text=await sync_to_async(transcribe,thread_sensitive=False)(content,filename)
+                        text=await sync_to_async(transcribe,thread_sensitive=False)(content,'voice.ogg')
                     else:
-                        from .integrations.llm import extract_document
-                        metadata=await sync_to_async(extract_document,thread_sensitive=False)(content,mime,filename)
-                        prepared={'upload':{'filename':Path(filename).name,'content':content,'mime_type':mime,'file_id':attachment['file_id'],'metadata':metadata}}
+                        prepared = await _process_file(payload, person, message, shared, attachment)
                 except Exception as exc:
                     from .error_reporting import report_error
                     error_id=await sync_to_async(report_error)(exc,'bot.attachment')
-                    prepared={'error':f'Не удалось получить или распознать вложение. Код ошибки: {error_id}. Можно прислать текст.'}
+                    from . import attachments
+                    saved, _ = await sync_to_async(attachments.saved_upload)(payload['update_id'], person, shared)
+                    if saved is not None:
+                        prepared={'reply':attachments.receipt(saved, text=f'Обработка вложения прервана. Код ошибки: {error_id}. Можно продолжить текстовым сообщением.'),
+                                  'text':attachments.request_text(saved, message)}
+                    else:
+                        prepared={'error':f'Не удалось получить или сохранить вложение. Код ошибки: {error_id}. Можно прислать текст.'}
         if prepared is None and text and not text.startswith('/'):
             try:
                 if getattr(settings,'AGENT_ENABLED',True):

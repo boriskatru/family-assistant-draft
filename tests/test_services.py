@@ -22,7 +22,8 @@ def test_private_busy_group(people):
     assert s.safe_event(e,b)['title']=='Занят'
     assert 'location' not in s.safe_event(e,b)
     assert s.safe_event(e,b,True)=={}
-    assert not s.visible(Event.objects.all(),a,True,True).exists()
+    assert list(s.visible(Event.objects.all(),a,True,True)) == [e]
+    assert s.safe_event(e,a,True)['title'] == e.title
 
 
 @pytest.mark.parametrize('organiser', [0, 1])

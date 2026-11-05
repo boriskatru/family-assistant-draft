@@ -33,8 +33,6 @@ def _visibility(raw, shared):
     value = raw or ('shared' if shared else 'private')
     if value not in {'private', 'shared'}:
         raise ValueError('Для адресной книги видимость: private или shared.')
-    if shared and value != 'shared':
-        raise PermissionDenied('Личные места и контакты создавайте в личном чате.')
     return value
 
 

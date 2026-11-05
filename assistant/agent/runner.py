@@ -355,19 +355,25 @@ class BudgetHooks(RunHooks):
 def _input_reference(ctx):
     from assistant.models import Person
     person=ctx.person
-    return {
+    reference = {
         'current_time':timezone.now().astimezone(ZoneInfo(person.timezone)).isoformat(),
         'timezone':person.timezone,
         'user_id':str(person.id),
         'user_name':person.name,
         'shared_context':ctx.shared_context,
         'autonomy':person.profile.get('agent_autonomy',getattr(settings,'AGENT_AUTONOMY','personal')),
-        'own_profile':({key:value for key,value in person.profile.items() if key in {
+        'own_profile':{key:value for key,value in person.profile.items() if key in {
             'locations','transport_mode','work_start','work_end','work_days',
             'sleep_start','sleep_end','max_daily_minutes','min_block_minutes','break_minutes',
-        }} if not ctx.shared_context else {}),
+        }},
         'allowed_people':[{'id':str(p.id),'name':p.name} for p in Person.objects.filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).order_by('pk')],
     }
+    if getattr(getattr(ctx, 'run', None), 'update_id', None) is not None:
+        from assistant.attachments import input_reference
+        attachment = input_reference(ctx)
+        if attachment:
+            reference['incoming_attachment'] = attachment
+    return reference
 
 
 _HISTORY_GUIDANCE = (
@@ -418,6 +424,9 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
         stage='agent.profile'
         from assistant.personal_context import build_instructions
         instructions = await sync_to_async(build_instructions)(SYSTEM_INSTRUCTIONS, getattr(ctx,'shared_context',False))
+        if reference.get('incoming_attachment'):
+            from .prompts import ATTACHMENT_INSTRUCTIONS
+            instructions += '\n' + ATTACHMENT_INSTRUCTIONS
         stage='agent.tools'
         agent=Agent(name='Family assistant',instructions=instructions,
                     model=model,tools=build_tools() if tools is None else tools,

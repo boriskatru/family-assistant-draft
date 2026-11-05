@@ -125,16 +125,18 @@ def test_expected_error_rolls_back_partial_mutation(people):
     assert 'Invalid final field' in replies()[0].payload['text']
 
 
-def test_private_entity_not_readable_in_group_even_by_owner(people,settings):
-    person,_=people
+def test_group_owner_can_read_private_entity_but_spouse_cannot(people,settings):
+    person,spouse=people
     settings.TELEGRAM_GROUP_ID=-500
     task=services.create_task(person,title='Личный секрет')
     payload=update(text=f'/show task {task.pk}',shared=True,chat=-500)
     process_sync(payload,person)
-    assert 'Личный секрет' not in replies()[0].payload['text']
+    assert 'Личный секрет' in replies()[0].payload['text']
     assert replies()[0].payload['shared_context'] is True
+    bot.dispatch_command(person,-500,'/task Секрет | - | 30 | private',True)
+    assert Task.objects.get(title='Секрет').visibility == 'private'
     with pytest.raises(PermissionDenied):
-        bot.dispatch_command(person,-500,'/task Секрет | - | 30 | private',True)
+        bot.dispatch_command(spouse,-500,f'/show task {task.pk}',True)
 
 
 def test_busy_listing_redacts_title_and_identifier(people):
@@ -247,18 +249,18 @@ def test_nonexistent_and_ambiguous_local_times_rejected(people):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_group_attachment_never_downloads_or_exposes_document(people,settings):
+def test_attachment_in_unknown_group_never_downloads(people,settings):
     person,_=people
     settings.TELEGRAM_GROUP_ID=-500
-    payload=update(shared=True,chat=-500)
+    payload=update(shared=True,chat=-501)
     payload['message'].pop('text')
     payload['message']['document']={'file_id':'secret','file_size':100,'file_name':'passport.pdf'}
     with patch.object(bot,'Bot') as client:
         asyncio.run(bot.process_update(payload))
         asyncio.run(bot.process_update(payload))
     client.assert_not_called()
-    assert len(replies())==1
-    assert 'личный чат' in replies()[0].payload['text']
+    assert len(replies())==0
+    assert not Document.objects.exists()
 
 
 @pytest.mark.parametrize('actor_index', [0, 1])
@@ -420,6 +422,19 @@ def test_stale_daily_plan_button_cannot_accept_replaced_draft(people):
     process_sync(update(callback=f'plan:{plan.day}:1'),person)
     assert 'План уже обновлён' in replies()[0].payload['text']
     assert not Event.objects.exists()
+
+
+def test_group_plan_button_belongs_to_requesting_person(people, settings):
+    person, spouse = people
+    settings.SHARED_CHAT_ID = settings.TELEGRAM_GROUP_ID = -500
+    day = (timezone.now() + timedelta(days=1)).date().isoformat()
+    reply = bot.dispatch_command(person, -500, '/plan ' + day, True)
+    callback = reply['reply_markup']['inline_keyboard'][0][0]['callback_data']
+    assert len(callback.encode()) <= 64
+    with pytest.raises(PermissionDenied):
+        bot.dispatch_callback(spouse, -500, callback, True)
+    accepted = bot.dispatch_callback(person, -500, callback, True)
+    assert 'План принят' in accepted['text']
 
 
 def test_llm_reply_preserves_both_context_and_result_permission_refs(people):

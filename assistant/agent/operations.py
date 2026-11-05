@@ -70,7 +70,6 @@ def execute_operation(ctx,name,args):
         return result
 
     if name=='plan_day':
-        if ctx.shared_context:raise PermissionDenied('Личный план доступен в личном чате.')
         from assistant.planning import render_daily_plan,plan_permission_refs
         day=_day(args['day'])
         text=render_daily_plan(ctx.person,day)
@@ -78,7 +77,6 @@ def execute_operation(ctx,name,args):
         return {'text':text,'day':str(day),'version':plan.version,'status':'draft','permission_refs':plan_permission_refs(ctx.person,day)}
 
     if name=='accept_daily_plan':
-        if ctx.shared_context:raise PermissionDenied('Личный план принимается в личном чате.')
         from assistant.planning import accept_plan,plan_permission_refs
         day=_day(args['day'])
         plan=DailyPlan.objects.select_for_update().get(person=ctx.person,day=day)

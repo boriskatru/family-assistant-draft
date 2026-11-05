@@ -55,19 +55,22 @@ def test_contacts_are_addressbook_records_and_do_not_authorise_users(people):
     assert card['entity_type'] == 'contact'
 
 
-def test_shared_group_only_lists_shared_places_and_cannot_publish_private_entry(people, settings):
+def test_shared_group_lists_own_private_and_shared_places_without_changing_visibility(people, settings):
     actor, spouse = people
     settings.TELEGRAM_GROUP_ID = settings.SHARED_CHAT_ID = -500
     private = addressbook.save_place(actor, {'title': 'Личный адрес'})
     public = addressbook.save_place(spouse, {'title': 'Общий адрес', 'visibility': 'shared'})
     result = bot.dispatch_command(actor, -500, '/places', shared=True)
-    assert private.title not in result['text'] and public.title in result['text']
+    assert private.title in result['text'] and public.title in result['text']
+    own_card = bot.dispatch_command(actor, -500, f'/show place {private.pk}', shared=True)
+    assert private.title in own_card['text']
     with pytest.raises(PermissionDenied):
-        bot.dispatch_command(actor, -500, f'/show place {private.pk}', shared=True)
-    finish(actor, payload(actor, '/place Не сохранять | адрес | private', shared=True))
-    assert Place.objects.count() == 2
+        bot.dispatch_command(spouse, -500, f'/show place {private.pk}', shared=True)
+    finish(actor, payload(actor, '/place Личное место | адрес | private', shared=True))
+    assert Place.objects.count() == 3
+    assert Place.objects.get(title='Личное место').visibility == 'private'
     reply = Job.objects.get(kind='telegram_send')
-    assert 'Личные места' in reply.payload['text']
+    assert 'Личное место' in reply.payload['text']
 
 
 def test_actor_aliases_search_and_ambiguity_are_preserved_in_ui(people):

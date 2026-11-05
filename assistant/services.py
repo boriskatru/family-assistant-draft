@@ -25,17 +25,19 @@ ENTITY_MODELS={'project':Project,'trip':Trip,'task':Task,'event':Event,'document
 
 
 def visible(qs,user,shared_context=False,include_busy=False):
-    if shared_context:
-        return qs.filter(visibility='shared')
+    if user.telegram_id not in settings.ALLOWED_TELEGRAM_IDS:
+        return qs.none()
+    # The configured family chat is a permitted destination for the sender's
+    # own records. It does not grant the other sender access to those records.
     q=Q(owner=user)|Q(visibility='shared')
-    if include_busy: q|=Q(visibility='busy_only')
+    if include_busy and not shared_context: q|=Q(visibility='busy_only')
     return qs.filter(q).distinct()
 
 
 def can_view(obj,user,shared_context=False):
+    if user.telegram_id not in settings.ALLOWED_TELEGRAM_IDS: return False
     if isinstance(obj,Checklist): obj=obj.parent
     if isinstance(obj,ChecklistItem): obj=obj.checklist.parent
-    if shared_context: return obj.visibility=='shared'
     return obj.owner_id==user.id or obj.visibility=='shared'
 
 
@@ -445,8 +447,7 @@ def undo_task_completion(user,task_id):
 def execute_action(user,action,shared_context=False):
     name=action.get('action');args=dict(action.get('args') or {})
     if shared_context and name.startswith('create_'):
-        if args.get('visibility','shared')!='shared':raise PermissionDenied('Личные записи создавайте в личном чате')
-        args['visibility']='shared'
+        args.setdefault('visibility','shared')
     if shared_context:
         for key,kind in [('project_id','project'),('trip_id','trip'),('task_id','task'),('event_id','event'),('document_id','document'),('place_id','place')]:
             if args.get(key):get_entity(kind,args[key],user,True)

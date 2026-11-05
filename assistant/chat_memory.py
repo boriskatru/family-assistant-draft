@@ -105,7 +105,7 @@ def read_chat_history(person, chat_id, shared, current_message_id=None, *, max_h
         obj = records[kind].get(pk)
         return obj is not None and (
             services.can_view(obj, person, shared) or
-            (mode == 'busy' and not shared and obj.visibility == 'busy_only')
+            (mode == 'busy' and obj.visibility == 'busy_only')
         )
 
     selected = []

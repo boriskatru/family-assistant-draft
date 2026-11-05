@@ -4,7 +4,7 @@ Project package config, app assistant. Django sync ORM. Models in assistant/mode
 
 Root owns models/settings/services.py/queue.py/runtime.py and management runworker/runscheduler/bootstrap_users. Others must not edit these; send requests.
 
-Services functions (sync; user is Person, shared_context excludes all nonshared content):
+Services functions (sync; user is Person; configured group requests allow the sender's own private records plus shared records, without changing visibility or granting access to the spouse's private records):
 - visible(queryset,user,shared_context=False,include_busy=False) -> queryset
 - can_view(obj,user,shared_context=False)->bool; can_edit(obj,user)->bool; safe_event(event,user,shared_context=False)->dict (busy redaction)
   can_edit: разрешённый Telegram ID обязателен; shared Event/Trip и их Checklist/ChecklistItem доступны обоим супругам. Private/busy_only остаются за владельцем. Для остальных типов — владелец/редактор/исполнитель. Согласование update_event проверяется отдельно.

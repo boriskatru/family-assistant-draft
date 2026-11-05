@@ -202,7 +202,7 @@ def test_checkpoint_discards_reasoning_and_unknown_internal_items():
     assert 'private reasoning' not in json.dumps(saved)
 
 
-def test_private_profile_locations_omitted_from_group_context(people):
+def test_sender_profile_available_in_group_context_without_internal_fields(people):
     person,_=people
     person.profile={'locations':{'home':'Secret home address'},'transport_mode':'walking','internal_secret':'never'}
     person.save()
@@ -212,7 +212,8 @@ def test_private_profile_locations_omitted_from_group_context(people):
     assert 'internal_secret' not in personal['own_profile']
     ctx.shared_context=True
     shared=_input_reference(ctx)
-    assert shared['own_profile']=={} and 'recent_user_messages' not in shared
+    assert shared['own_profile']==personal['own_profile']
+    assert 'internal_secret' not in shared['own_profile'] and 'recent_user_messages' not in shared
 
 
 @pytest.mark.django_db(transaction=True)

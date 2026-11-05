@@ -390,8 +390,6 @@ def search_documents(user, query, offset=0, limit=10, shared_context=False):
 def available_slots(user, day, duration_minutes=60, participants=None, shared_context=False):
     """Compute common free windows without disclosing private blocking events."""
     _authorise(user)
-    if shared_context:
-        raise PermissionDenied('Личную занятость проверяйте в личном чате с ботом.')
     if type(duration_minutes) is not int or not 5 <= duration_minutes <= 1440:
         raise ValidationError('Длительность: от 5 до 1440 минут.')
     try:

@@ -72,7 +72,7 @@ def send_payload(job,payload):
                 try:
                     obj=model.objects.get(pk=ref.get('id'))
                     readable=can_view(obj,actor,shared)
-                    if not readable and ref.get('mode')=='busy' and isinstance(obj,Event) and not shared:
+                    if not readable and ref.get('mode')=='busy' and isinstance(obj,Event):
                         readable=obj.visibility=='busy_only'
                 except (model.DoesNotExist,ValidationError,ValueError,TypeError):
                     pass

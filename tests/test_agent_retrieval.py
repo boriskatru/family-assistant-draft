@@ -108,8 +108,9 @@ def test_original_text_is_read_beyond_legacy_excerpt_and_paginates(people, tmp_p
     with pytest.raises(PermissionDenied):
         retrieval.read_document(b, str(doc.pk))
     assert retrieval.search_documents(b, 'Япония')['results'] == []
+    assert 'Япония' in retrieval.read_document(a, str(doc.pk), offset=35000, shared_context=True)['text']
     with pytest.raises(PermissionDenied):
-        retrieval.read_document(a, str(doc.pk), shared_context=True)
+        retrieval.read_document(b, str(doc.pk), shared_context=True)
 
 
 def test_pdf_reads_original_later_pages_with_page_citations(people, tmp_path, settings):
@@ -169,7 +170,8 @@ def test_document_caption_preserved_alongside_ocr_and_acl(people, tmp_path, sett
     card = bot.dispatch_command(owner, owner.chat_id, f'/show document {doc.pk}', False)
     assert caption in card['text'] and 'Распознанные сведения' not in card['text']
     assert retrieval.search_documents(spouse, query)['results'] == []
-    assert retrieval.search_records(owner, 'document', query, shared_context=True)['total'] == 0
+    assert retrieval.search_records(owner, 'document', query, shared_context=True)['total'] == 1
+    assert retrieval.search_records(spouse, 'document', query, shared_context=True)['total'] == 0
     with pytest.raises(PermissionDenied):
         bot.dispatch_command(spouse, spouse.chat_id, f'/show document {doc.pk}', False)
     with pytest.raises(PermissionDenied):
@@ -233,8 +235,9 @@ def test_common_availability_uses_private_times_without_details(people, monkeypa
     assert 'Скрытый' not in str(result) and str(private.pk) not in str(result)
     assert result['availability_only'] is True
     assert Event.objects.count() == 1
-    with pytest.raises(PermissionDenied):
-        retrieval.available_slots(a, DAY, shared_context=True)
+    shared = retrieval.available_slots(a, DAY, participants=[str(a.pk), str(b.pk)], shared_context=True)
+    assert shared['windows'] == result['windows']
+    assert 'Скрытый' not in str(shared) and str(private.pk) not in str(shared)
 
 
 def test_unknown_or_unauthorised_participant_fails(people):

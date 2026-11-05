@@ -57,6 +57,7 @@ class AgentContext:
     shared_context: bool
     chat_id: int
     external_count: int=0
+    attachment_read_only: bool=False
     _lock: asyncio.Lock=field(default_factory=asyncio.Lock)
     _egress: EgressGuard=field(init=False)
 
@@ -120,6 +121,8 @@ class AgentContext:
             if previous:
                 return {**previous.result,'replayed':True}
             self.person.refresh_from_db(fields=['profile'])
+            if self.attachment_read_only:
+                raise PermissionDenied('Это часть альбома. Дождитесь отдельного поручения пользователя после загрузки всех частей.')
             if self.autonomy=='read_only' and name!='send_document':
                 raise PermissionDenied('Включён режим read_only: изменять расписание нельзя. /agent autonomy personal')
             result=executor()

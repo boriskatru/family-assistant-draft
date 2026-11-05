@@ -88,8 +88,6 @@ def _save(user, kind, data, shared_context):
         obj = _model(kind)(owner=user)
         values.setdefault('visibility', 'shared' if shared_context else 'private')
     target_visibility = values.get('visibility', obj.visibility)
-    if shared_context and target_visibility != 'shared':
-        raise PermissionDenied('В общем чате создаются и изменяются только общие карточки.')
     if kind == 'place' and 'address' in values and values['address'] != obj.address:
         values.setdefault('address_confirmed', False)
         # An old coordinate must not silently survive an address change.

@@ -204,7 +204,11 @@ def test_shared_trip_does_not_expose_private_children(users):
     TripSegment.objects.create(trip=trip,event=right)
     assert check_trip(trip,user=b)==[]
     assert check_trip(trip)==[]
-    assert check_trip(trip,user=a,shared_context=True)==[]
+    assert check_trip(trip,user=b,shared_context=True)==[]
+    own = check_trip(trip,user=a,shared_context=True)
+    assert len(own) == 1
+    assert own[0]['from_event_id'] == str(left.pk)
+    assert own[0]['to_event_id'] == str(right.pk)
     assert check_trip(trip,user=a)[0]['from']=='Secret itinerary'
 
 
