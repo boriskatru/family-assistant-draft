@@ -15,4 +15,5 @@ backups/
 media/
 data/
 *.zip
+private/
 /.vs/family-assistant-draft/FileContentIndex
