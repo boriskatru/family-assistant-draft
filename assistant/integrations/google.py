@@ -40,9 +40,86 @@ FUTURE_DAYS = 180
 class GoogleIntegrationError(ValueError):
     """Safe error text: no token/Google response body is exposed."""
 
+    provider = 'google_calendar'
+
+    def __init__(self, message, *, status_code=None, reason=None, operation=None,
+                 failure_count=None, retryable_count=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.reason = reason
+        self.operation = operation
+        self.failure_count = failure_count
+        self.retryable_count = retryable_count
+
 
 class GoogleRetryableError(GoogleIntegrationError):
     pass
+
+
+# Only machine codes from this allowlist may leave the HTTP adapter. Google
+# messages/URLs can contain event data, account names or credentials.
+_GOOGLE_REASONS = frozenset({
+    'badRequest', 'invalid', 'required', 'forbidden', 'insufficientPermissions',
+    'forbiddenForNonOrganizer', 'notFound', 'gone', 'deleted', 'conditionNotMet',
+    'duplicate', 'rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded',
+    'dailyLimitExceeded', 'calendarUsageLimitsExceeded', 'backendError',
+    'internalError', 'authError', 'updatedMinTooLongAgo', 'fullSyncRequired',
+    'invalid_grant', 'invalid_client', 'unauthorized_client', 'invalid_request',
+    'unsupported_grant_type', 'invalid_scope', 'access_denied',
+    'temporarily_unavailable', 'server_error',
+})
+_RETRYABLE_REASONS = frozenset({
+    'rateLimitExceeded', 'userRateLimitExceeded', 'backendError',
+    'internalError', 'temporarily_unavailable', 'server_error',
+})
+
+
+def _response_reason(response):
+    try:
+        payload = response.json()
+    except (ValueError, UnicodeError):
+        return None
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if isinstance(error, str):
+        return error if error in _GOOGLE_REASONS else None
+    if isinstance(error, dict):
+        errors = error.get('errors', [])
+        if isinstance(errors, list):
+            for item in errors[:20]:
+                reason = item.get('reason') if isinstance(item, dict) else None
+                if isinstance(reason, str) and reason in _GOOGLE_REASONS:
+                    return reason
+    return None
+
+
+def _operation(method, path):
+    if path == '/users/me/calendarList':
+        return 'calendar_list'
+    if '/events/' in path:
+        return {'GET': 'event_get', 'PATCH': 'event_update',
+                'PUT': 'event_update', 'DELETE': 'event_delete'}.get(method)
+    if path.endswith('/events'):
+        return 'calendar_sync' if method == 'GET' else 'event_insert'
+    return None
+
+
+def _response_error(response, operation):
+    status, reason = response.status_code, _response_reason(response)
+    retryable = status == 429 or status >= 500 or reason in _RETRYABLE_REASONS
+    error_type = GoogleRetryableError if retryable else GoogleIntegrationError
+    if retryable:
+        message = 'Google временно недоступен или ограничил запросы; действие будет повторено.'
+    elif reason == 'forbiddenForNonOrganizer':
+        message = 'Google разрешает изменение этих полей только организатору события.'
+    elif status == 403:
+        message = 'Google отклонил запрос: проверьте права календаря и квоты проекта.'
+    elif status == 400:
+        message = 'Google отклонил параметры запроса.'
+    elif status == 404:
+        message = 'Событие или календарь Google не найдены либо недоступны.'
+    else:
+        message = f'Google отклонил запрос (HTTP {status}).'
+    return error_type(message, status_code=status, reason=reason, operation=operation)
 
 
 def _cipher():
@@ -148,8 +225,12 @@ def _access_token(connection):
     # Row lock prevents two workers from racing a refresh-token rotation.
     with transaction.atomic():
         locked = CalendarConnection.objects.select_for_update().get(pk=connection.pk)
+        if not locked.enabled:
+            raise GoogleIntegrationError('Google отключён. Выполните /google для повторного подключения.',
+                                         reason='invalid_grant', operation='token_refresh')
         tokens = _decrypt(locked)
         if tokens.get('access_token') and float(tokens.get('expires_at', 0)) > timezone.now().timestamp() + 60:
+            connection.encrypted_tokens = locked.encrypted_tokens
             return tokens['access_token']
         try:
             response = httpx.post(TOKEN_URL, data={
@@ -157,14 +238,17 @@ def _access_token(connection):
                 'refresh_token': tokens.get('refresh_token', ''), 'grant_type': 'refresh_token',
             }, timeout=TIMEOUT, follow_redirects=False)
         except httpx.HTTPError as exc:
-            raise GoogleRetryableError('Google временно недоступен.') from exc
-        if response.status_code in (400, 401):
+            raise GoogleRetryableError('Google временно недоступен.',
+                                       reason='network_error', operation='token_refresh') from exc
+        if response.status_code in (400, 401) and _response_reason(response) == 'invalid_grant':
             locked.enabled = False
             locked.save(update_fields=['enabled', 'updated_at'])
             # Raise outside atomic to persist the disabled flag.
             result = None
         elif response.status_code != 200:
-            raise GoogleRetryableError('Не удалось обновить доступ Google; повтор будет выполнен позже.')
+            # A bad OAuth client/configuration is not a revoked user grant.
+            # Keep the refresh token so fixing settings does not require consent again.
+            raise _response_error(response, 'token_refresh')
         else:
             new = response.json()
             if not new.get('access_token'):
@@ -176,31 +260,41 @@ def _access_token(connection):
             connection.encrypted_tokens = locked.encrypted_tokens
             result = tokens['access_token']
     if result is None:
+        connection.enabled = False
         _notify(connection.person, 'Доступ Google отозван или истёк. Подключите календарь заново: /google.', f'google-auth-{connection.pk}')
-        raise GoogleIntegrationError('Google требует повторного подключения: /google.')
+        raise GoogleIntegrationError('Google требует повторного подключения: /google.',
+                                     status_code=response.status_code, reason='invalid_grant', operation='token_refresh')
     return result
 
 
 def _request(connection, method, path, *, params=None, body=None, etag=None, allowed=()):
-    headers = {'Authorization': 'Bearer ' + _access_token(connection)}
+    access_token = _access_token(connection)
+    operation = _operation(method, path)
+    headers = {'Authorization': 'Bearer ' + access_token}
     if etag:
         headers['If-Match'] = etag
     try:
         response = httpx.request(method, API + path, params=params, json=body, headers=headers,
                                 timeout=TIMEOUT, follow_redirects=False)
     except httpx.HTTPError as exc:
-        raise GoogleRetryableError('Сбой соединения с Google; действие будет повторено.') from exc
+        raise GoogleRetryableError('Сбой соединения с Google; действие будет повторено.',
+                                   reason='network_error', operation=operation) from exc
     if response.status_code in allowed or 200 <= response.status_code < 300:
         return response
     if response.status_code == 401:
-        tokens = _decrypt(connection)
-        tokens['expires_at'] = 0
-        connection.encrypted_tokens = _encrypt(tokens)
-        connection.save(update_fields=['encrypted_tokens', 'updated_at'])
-        raise GoogleRetryableError('Доступ Google обновляется; действие будет повторено.')
-    if response.status_code == 429 or response.status_code >= 500:
-        raise GoogleRetryableError('Google временно ограничил запросы; действие будет повторено.')
-    raise GoogleIntegrationError(f'Google отклонил запрос (HTTP {response.status_code}). Проверьте права и параметры календаря.')
+        # Another worker may already have refreshed/rotated the credentials.
+        # Never overwrite its fresh token with the stale in-memory connection.
+        with transaction.atomic():
+            locked = CalendarConnection.objects.select_for_update().get(pk=connection.pk)
+            tokens = _decrypt(locked)
+            if tokens.get('access_token') == access_token:
+                tokens['expires_at'] = 0
+                locked.encrypted_tokens = _encrypt(tokens)
+                locked.save(update_fields=['encrypted_tokens', 'updated_at'])
+            connection.encrypted_tokens = locked.encrypted_tokens
+        raise GoogleRetryableError('Доступ Google обновляется; действие будет повторено.',
+                                   status_code=401, reason='authError', operation=operation)
+    raise _response_error(response, operation)
 
 
 def _notify(person, text, key):
@@ -387,6 +481,22 @@ def _export_payload(event):
     else:
         body['start'] = {'dateTime': event.starts_at.isoformat(), 'timeZone': event.timezone}
         body['end'] = {'dateTime': event.ends_at.isoformat(), 'timeZone': event.end_timezone}
+    return body
+
+
+def _patch_payload(event, remote):
+    body = _export_payload(event)
+    # Google merges nested PATCH objects. Omitting the old representation of
+    # start/end leaves both date and dateTime after an all-day/timed conversion.
+    # Explicit null removes those fields without replacing provider metadata.
+    for boundary in ('start', 'end'):
+        previous = remote.get(boundary) or {}
+        obsolete = ('dateTime', 'timeZone') if event.all_day and previous.get('dateTime') else ()
+        if not event.all_day:
+            obsolete = ('date',)
+        for field in obsolete:
+            if field in previous:
+                body[boundary][field] = None
     return body
 
 
@@ -750,7 +860,7 @@ def sync_event(event_id, create_meet=False):
         else:
             _import_item(source, {'id': external_id, 'status': 'cancelled', 'etag': 'deleted'})
         return
-    body = _export_payload(event)
+    body = _patch_payload(event, remote) if remote else _export_payload(event)
     conference = (remote or {}).get('conferenceData', {})
     need_write = not remote or not binding or _snapshot(event) != _baseline_snapshot(binding.snapshot, event)
     if create_meet and not event.meeting_url and not conference:
@@ -828,13 +938,18 @@ def sync_all():
         try:
             sync_source(source)
         except GoogleIntegrationError as exc:
-            failures.append(str(exc))
-            _notify(source.connection.person, str(exc), f'google-source-error-{source.id}-{timezone.now():%Y%m%d%H}')
+            failures.append(exc)
     for event in Event.objects.exclude(status='proposed').filter(
             Q(sync_status__in=['pending', 'error']) | Q(calendar_bindings__isnull=False)).distinct():
         try:
             sync_event(event.pk)
         except GoogleIntegrationError as exc:
-            failures.append(str(exc))
+            failures.append(exc)
     if failures:
-        raise GoogleRetryableError(f'Не все календари синхронизированы ({len(failures)}). Детали отправлены владельцу.')
+        retryable_count = sum(isinstance(exc, GoogleRetryableError) for exc in failures)
+        representative = next((exc for exc in failures if not isinstance(exc, GoogleRetryableError)), failures[0])
+        error_type = GoogleRetryableError if retryable_count else GoogleIntegrationError
+        raise error_type(f'Не все операции синхронизации Google выполнены ({len(failures)}).',
+                         status_code=representative.status_code, reason=representative.reason,
+                         operation=representative.operation or 'calendar_sync',
+                         failure_count=len(failures), retryable_count=retryable_count) from representative

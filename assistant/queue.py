@@ -1,9 +1,12 @@
+import json
 import uuid
 from datetime import timedelta
 from django.db import transaction, connection
 from django.db.models import Q
 from django.utils import timezone
 from .models import Job
+
+MAX_ATTEMPTS = 5
 
 
 def enqueue(kind,payload,dedup_key,run_at=None,queue='service'):
@@ -30,10 +33,19 @@ def heartbeat(job):
     return Job.objects.filter(pk=job.pk,status='running',lock_token=job.lock_token).update(locked_until=timezone.now()+timedelta(minutes=3))
 
 
-def finish(job,error=None):
+def finish(job,error=None,*,retryable=True):
     fields={'locked_until':None,'lock_token':None}
     if error:
-        fields.update(status='failed' if job.attempts>=5 else 'pending',error=type(error).__name__,run_at=timezone.now()+timedelta(seconds=min(900,15*2**job.attempts)))
+        from .error_reporting import safe_error_details
+        details = safe_error_details(error, 'worker.' + job.queue)
+        error_value = details['type']
+        if details.get('provider') == 'google_calendar':
+            # Job.error is limited to 500 characters. Store machine metadata
+            # only; no provider body, exception message, URLs, or user payload.
+            error_value = json.dumps({key: details[key] for key in
+                ('type', 'provider', 'status', 'code', 'operation', 'failure_count', 'retryable_count')
+                if key in details}, separators=(',', ':'), ensure_ascii=True)
+        fields.update(status='failed' if not retryable or job.attempts>=MAX_ATTEMPTS else 'pending',error=error_value,run_at=timezone.now()+timedelta(seconds=min(900,15*2**job.attempts)))
     else:
         fields.update(status='done',error='')
     return Job.objects.filter(pk=job.pk,status='running',lock_token=job.lock_token).update(**fields)

@@ -41,6 +41,66 @@ _STATUS_REASONS = {
     409: 'Конфликт запроса. Для Telegram проверьте, не запущен ли второй экземпляр polling.',
     429: 'Сервис ограничил запросы или исчерпана квота.',
 }
+_GOOGLE_REASONS = {
+    'badRequest': 'Google отклонил параметры события. Нужно проверить формат данных.',
+    'invalid': 'Google отклонил значение одного из параметров события.',
+    'required': 'Google не получил обязательный параметр запроса.',
+    'forbidden': 'Google отказал в доступе к календарю или событию. Проверьте права подключения.',
+    'insufficientPermissions': 'Подключению Google не хватает прав для этой операции.',
+    'forbiddenForNonOrganizer': 'Google разрешает менять эти поля только организатору события.',
+    'notFound': 'Календарь или событие не найдены либо недоступны подключённому аккаунту.',
+    'gone': 'Событие удалено либо состояние синхронизации Google устарело.',
+    'deleted': 'Событие удалено в Google Calendar.',
+    'conditionNotMet': 'Событие изменилось во время обновления. Нужна повторная синхронизация.',
+    'duplicate': 'Google уже содержит объект с таким идентификатором.',
+    'rateLimitExceeded': 'Google временно ограничил частоту запросов.',
+    'userRateLimitExceeded': 'Google временно ограничил частоту запросов аккаунта.',
+    'quotaExceeded': 'Исчерпана квота запросов Google Calendar.',
+    'dailyLimitExceeded': 'Исчерпана дневная квота Google Calendar.',
+    'calendarUsageLimitsExceeded': 'Превышен лимит использования Google Calendar.',
+    'backendError': 'Временная ошибка на стороне Google Calendar.',
+    'internalError': 'Временная внутренняя ошибка Google Calendar.',
+    'authError': 'Google отклонил авторизацию подключения.',
+    'invalid_grant': 'Google отозвал или отклонил разрешение подключения. Требуется повторное подключение аккаунта.',
+    'invalid_client': 'Google отклонил настройки OAuth-клиента. Проверьте GOOGLE_CLIENT_ID и GOOGLE_CLIENT_SECRET.',
+    'unauthorized_client': 'Google не разрешает этому OAuth-клиенту запрошенный способ авторизации.',
+    'invalid_request': 'Google отклонил параметры запроса авторизации.',
+    'unsupported_grant_type': 'Google не поддерживает выбранный способ обмена OAuth-токенов.',
+    'invalid_scope': 'Google отклонил запрошенные разрешения подключения.',
+    'access_denied': 'Google не предоставил разрешение на подключение.',
+    'temporarily_unavailable': 'Сервис авторизации Google временно недоступен.',
+    'server_error': 'Временная ошибка на стороне Google.',
+    'updatedMinTooLongAgo': 'Период синхронизации Google устарел. Нужна полная синхронизация.',
+    'fullSyncRequired': 'Google требует полную синхронизацию календаря.',
+    'network_error': 'Не удалось связаться с Google. Проверьте сеть сервера.',
+    'timeout': 'Истекло время ожидания ответа Google.',
+    'configuration_error': 'Проверьте настройки интеграции Google и ключ шифрования токенов.',
+    'token_decryption_failed': 'Не удалось расшифровать токены Google. Проверьте ключ шифрования.',
+    'token_missing': 'В подключении Google отсутствует необходимый токен авторизации.',
+}
+_GOOGLE_STATUS_REASONS = {
+    400: 'Google отклонил параметры запроса. Проверьте данные события или настройки OAuth.',
+    401: 'Google отклонил авторизацию подключения.',
+    403: 'Google отказал в доступе или ограничил запросы. Проверьте права подключения и квоты.',
+    404: _GOOGLE_REASONS['notFound'],
+    409: 'Google сообщил о конфликте данных события.',
+    410: _GOOGLE_REASONS['gone'],
+    412: _GOOGLE_REASONS['conditionNotMet'],
+    429: _GOOGLE_REASONS['rateLimitExceeded'],
+}
+_GOOGLE_OPERATIONS = {
+    'calendar_list': 'получение списка календарей',
+    'event_get': 'чтение события',
+    'event_insert': 'создание события',
+    'event_update': 'изменение события',
+    'event_delete': 'удаление события',
+    'calendar_sync': 'синхронизация календаря',
+    'token_refresh': 'обновление токена доступа',
+    'meet_create': 'создание видеовстречи',
+    'oauth_exchange': 'подключение аккаунта',
+}
+_GOOGLE_TYPES = {'GoogleIntegrationError', 'GoogleRetryableError',
+                 'GoogleSyncError', 'GoogleSyncRetryableError'}
 _TYPE_REASONS = {
     'APITimeoutError': 'Истекло время ожидания API.',
     'TimeoutError': 'Истекло время выполнения операции.',
@@ -118,6 +178,56 @@ def _project_frames(chain):
     return frames[-4:]
 
 
+def _google_metadata(values):
+    """Sanitize both live provider attributes and persisted diagnostic records."""
+    if values.get('provider') != 'google_calendar':
+        return {}
+    details = {'provider': 'google_calendar'}
+    code = values.get('code')
+    if isinstance(code, str) and code in _GOOGLE_REASONS:
+        details['code'] = code
+    operation = values.get('operation')
+    if isinstance(operation, str) and operation in _GOOGLE_OPERATIONS:
+        details['operation'] = operation
+    status = values.get('status')
+    if type(status) is int and 400 <= status <= 599:
+        details['status'] = status
+    for key in ('failure_count', 'retryable_count'):
+        count = values.get(key)
+        if type(count) is int and 0 <= count <= 1000000:
+            details[key] = count
+    return details
+
+
+def _google_reason(details):
+    return (_GOOGLE_REASONS.get(details.get('code')) or
+            _GOOGLE_STATUS_REASONS.get(details.get('status')) or
+            ('Временная ошибка на стороне Google.' if details.get('status', 0) >= 500 else
+             'Не удалось выполнить операцию Google Calendar. Для диагностики используйте код ошибки и место в коде.'))
+
+
+def stored_google_error_details(value):
+    """Read only known machine fields; historical Job.error may contain raw text."""
+    if not isinstance(value, str) or len(value) > 500:
+        return {}
+    if value in _GOOGLE_TYPES:
+        return {'type': value, 'provider': 'google_calendar'}
+    try:
+        raw = json.loads(value)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    error_type = raw.get('type')
+    if not isinstance(error_type, str) or error_type not in _GOOGLE_TYPES:
+        return {}
+    details = _google_metadata(raw)
+    if not details:
+        return {}
+    details['type'] = error_type
+    return details
+
+
 def safe_error_details(exc, stage):
     """Return bounded, allowlisted technical metadata; never raw exception text."""
     chain = list(_exception_chain(exc)) or [RuntimeError()]
@@ -126,6 +236,15 @@ def safe_error_details(exc, stage):
         status = getattr(error, 'status_code', None)
         if type(status) is int and 400 <= status <= 599 and 'status' not in details:
             details['status'] = status
+        google = _google_metadata({
+            'provider': getattr(error, 'provider', None),
+            'status': status, 'code': getattr(error, 'reason', None),
+            'operation': getattr(error, 'operation', None),
+            'failure_count': getattr(error, 'failure_count', None),
+            'retryable_count': getattr(error, 'retryable_count', None),
+        })
+        for key, value in google.items():
+            details.setdefault(key, value)
         code = getattr(error, 'code', None)
         if isinstance(code, str) and code in _REASONS and 'code' not in details:
             details['code'] = code
@@ -145,6 +264,8 @@ def safe_error_details(exc, stage):
         _STATUS_REASONS.get(details.get('status'),
             'Временная ошибка сервиса.' if details.get('status', 0) >= 500 else
             'Внутренняя ошибка приложения. Для диагностики используйте код ошибки и место в коде.'))
+    if details.get('provider') == 'google_calendar':
+        details['reason'] = _google_reason(details)
     details['frames'] = _project_frames(chain)
     return details
 
@@ -177,12 +298,22 @@ def may_deliver_alert(payload):
 
 def _text(error_id, details, run_id, job_id):
     lines = [f'Ошибка бота · {error_id}', f"Этап: {details['stage']}", f"Тип: {details['type']}"]
+    if details.get('provider') == 'google_calendar':
+        lines.append('Сервис: Google Calendar')
+    if details.get('operation') in _GOOGLE_OPERATIONS:
+        lines.append('Операция: ' + _GOOGLE_OPERATIONS[details['operation']])
     if details.get('status'):
         lines.append(f"HTTP: {details['status']}")
     for key, label in (('code', 'Код API'), ('param', 'Параметр'), ('tool', 'Инструмент')):
         if key in details:
             lines.append(f'{label}: {details[key]}')
     lines.append(details['reason'])
+    if details.get('failure_count') is not None:
+        lines.append(f"Неудачных операций: {details['failure_count']}")
+    if details.get('retryable_count') is not None:
+        lines.append(f"Из них с временной ошибкой: {details['retryable_count']}")
+    if details.get('retry_exhausted'):
+        lines.append('Автоматические повторные попытки этого задания исчерпаны.')
     if details['frames']:
         lines.append('Код: ' + ' → '.join(details['frames']))
     if run_id:
@@ -193,7 +324,7 @@ def _text(error_id, details, run_id, job_id):
     return '\n'.join(lines)
 
 
-def report_error(exc, stage, run_id=None, job_id=None):
+def report_error(exc, stage, run_id=None, job_id=None, *, notify=True, retry_exhausted=False):
     """Log safe diagnostics and enqueue at most one private alert per cooldown interval.
 
     Never raise from an exception handler, even if the database is unavailable.
@@ -202,8 +333,10 @@ def report_error(exc, stage, run_id=None, job_id=None):
     error_id = uuid.uuid4().hex[:12]
     try:
         details = safe_error_details(exc, stage)
+        if retry_exhausted:
+            details['retry_exhausted'] = True
         run_id, job_id = _safe_uuid(run_id), _safe_uuid(job_id)
-        if _admin_id():
+        if notify and _admin_id():
             with transaction.atomic():
                 admin = _admin(lock=True)
                 if admin:
@@ -211,7 +344,7 @@ def report_error(exc, stage, run_id=None, job_id=None):
                     from assistant.queue import enqueue
                     cooldown = max(1, int(getattr(settings, 'ERROR_ALERT_COOLDOWN_SECONDS', 600)))
                     fingerprint = hashlib.sha256(json.dumps({key: details.get(key) for key in
-                        ('stage', 'type', 'code', 'status', 'param', 'tool', 'frames')}, sort_keys=True).encode()).hexdigest()[:24]
+                        ('stage', 'type', 'provider', 'operation', 'code', 'status', 'param', 'tool', 'frames', 'retry_exhausted')}, sort_keys=True).encode()).hexdigest()[:24]
                     prefix = f'error-alert:{admin.telegram_id}:{fingerprint}:'
                     # The administrator row serializes reporters across all worker
                     # processes. A rolling interval avoids bursts at bucket borders.
@@ -224,8 +357,9 @@ def report_error(exc, stage, run_id=None, job_id=None):
                                    'text': _text(error_id, details, run_id, job_id),
                                    'error_alert': True, 'error_id': error_id}
                         enqueue('telegram_send', payload, prefix+error_id, queue='notifications')
-        logger.error('Bot error id=%s details=%s run=%s job=%s', error_id,
-                     json.dumps(details, ensure_ascii=False, sort_keys=True), run_id or '-', job_id or '-')
+        log = logger.error if notify else logger.warning
+        log('Bot error id=%s details=%s run=%s job=%s', error_id,
+            json.dumps(details, ensure_ascii=False, sort_keys=True), run_id or '-', job_id or '-')
     except Exception:
         # Do not log the reporting exception: it may include credentials from
         # DATABASE_URL. Preserve only safe original metadata when possible.

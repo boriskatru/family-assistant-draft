@@ -8,6 +8,8 @@ Python 3.12 · Django · aiogram · OpenAI Agents SDK · PostgreSQL · Docker Co
 
 ## Быстрый запуск на VPS
 
+Для уже работающего бота: [исправление ошибок Google и инструкция обновления от 09.11.2026](docs/UPDATE_2026-11-09_GOOGLE.md).
+
 Ориентир: Ubuntu 24.04 LTS, 2 vCPU, 4 ГБ RAM, 40 ГБ SSD. Команды выполняются из распакованного каталога `family-assistant` под пользователем с правом запускать Docker.
 
 ```bash
