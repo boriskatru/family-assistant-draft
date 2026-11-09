@@ -10,7 +10,10 @@ from tests.test_agent_runner import FakeContext, ScriptedModel, answer, basic_to
 @pytest.mark.parametrize('name,value', [
     ('AGENT_MAX_OUTPUT_TOKENS', '-1'),
     ('AGENT_MAX_TOTAL_TOKENS', 'invalid'),
-    ('AGENT_HISTORY_USER_LIMIT', '51'),
+    ('AGENT_HISTORY_USER_LIMIT', '0'),
+    ('AGENT_MODEL_TIMEOUT_SECONDS', '0'),
+    ('AGENT_MODEL_RETRIES', '-1'),
+    ('AGENT_MAX_CONTINUATIONS', '-1'),
     ('LLM_REASONING_EFFORT', 'unknown'),
     ('LLM_PROMPT_CACHE_TTL', 'unknown'),
 ])

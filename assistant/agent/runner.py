@@ -30,7 +30,7 @@ from openai.types.shared import Reasoning
 
 from assistant.integrations.llm import (
     ChecklistArgs, CompleteTaskArgs, EventArgs, ProjectArgs, TaskArgs, TripArgs,
-    UpdateEventArgs, _credentials,
+    UpdateEventArgs, UpdateTaskArgs, ConvertTaskToEventArgs, _credentials,
 )
 from assistant.addressbook_schemas import ContactArgs, PlaceArgs
 from .prompts import SYSTEM_INSTRUCTIONS
@@ -118,6 +118,7 @@ async def _addressbook_read(wrapper, name, args):
 
 def build_tools():
     """Create independent typed native function tools for one run."""
+    from .editing_tools import build_editing_tools
     # ToolContext's first parameter is SDK-only; it is never exposed to the LLM.
     @function_tool
     async def search_records(ctx: ToolContext, kind: Literal['event','task','project','trip','document'], query: str = '', date_from: str | None = None, date_to: str | None = None, status: str = '', offset: int = 0, limit: int = 20) -> dict:
@@ -226,6 +227,7 @@ def build_tools():
     async def create_event(ctx: ToolContext, data: EventArgs) -> dict:
         """For a joint event use shared visibility and both allowed participant IDs. Either spouse can create it directly.
         Set kind=call for calls and kind=travel for departures. Link known trip_id during creation.
+        For date-only birthdays use all_day=true, start_date and blocks_time=false, without times; end_date is exclusive.
         Use null for default remind_minutes. Preserve a supplied meeting_url; request Meet only if asked."""
         return await _operation(ctx, 'create_event', data.model_dump(mode='json',exclude_none=True))
 
@@ -233,6 +235,19 @@ def build_tools():
     async def update_event(ctx: ToolContext, data: UpdateEventArgs) -> dict:
         """Update/move/cancel a known event with the exact current version. Either authorised spouse can edit shared events immediately, without spouse approval."""
         return await _operation(ctx, 'update_event', data.model_dump(mode='json',exclude_none=True))
+
+    @function_tool
+    async def update_task(ctx: ToolContext, data: UpdateTaskArgs) -> dict:
+        """Edit a known task using its current version. Either spouse may edit shared tasks immediately.
+        due_at is a deadline, not a fixed work slot; clear_due_at removes it. Cancel obsolete tasks with status=cancelled."""
+        return await _operation(ctx, 'update_task', data.model_dump(mode='json',exclude_none=True))
+
+    @function_tool
+    async def convert_task_to_event(ctx: ToolContext, data: ConvertTaskToEventArgs) -> dict:
+        """Correct a task mistakenly recorded instead of an event atomically: create event and cancel source task.
+        Read task/version and check existing events first. For birthdays use all_day=true, start_date, blocks_time=false.
+        Preserve separate preparation/gift tasks. Null title/description/visibility/domain preserve the source values."""
+        return await _operation(ctx, 'convert_task_to_event', data.model_dump(mode='json',exclude_none=True))
 
     @function_tool
     async def complete_task(ctx: ToolContext, data: CompleteTaskArgs) -> dict:
@@ -288,12 +303,12 @@ def build_tools():
     return [search_records,read_record,search_addressbook,read_addressbook,save_place,save_contact,set_place_alias,
             search_documents,read_document,available_slots,
             search_web,read_webpage,search_places,route_between,route_places,
-            create_project,create_trip,create_task,create_event,update_event,complete_task,make_checklist,
+            create_project,create_trip,create_task,create_event,update_event,update_task,convert_task_to_event,complete_task,make_checklist,
             link_document,send_document,add_trip_segment,plan_day,accept_daily_plan,check_trip,
-            set_checklist_item,configure_recurrence]
+            set_checklist_item,configure_recurrence] + build_editing_tools(function_tool, _operation)
 
 
-def _public_checkpoint(items):
+def _public_checkpoint(items, *, limit=80):
     """Keep tool/message protocol only, never model reasoning items or hidden state."""
     result=[]
     for item in items:
@@ -304,10 +319,10 @@ def _public_checkpoint(items):
         kind=item.get('type','message')
         if kind not in ('message','function_call','function_call_output'):
             continue
-        allowed=('type','role','content','name','arguments','call_id','output','status')
+        allowed=('id','type','role','content','name','arguments','call_id','output','status')
         result.append({k:v for k,v in item.items() if k in allowed})
     # A bounded audit snapshot, not an unbounded transcript or automatic replay.
-    return result[-80:]
+    return result[-limit:] if limit else result
 
 
 def _prompt_chars(instructions, tools, inputs):
@@ -334,7 +349,9 @@ class BudgetHooks(RunHooks):
         if remaining<=0 or input_estimate>=remaining:
             raise AgentBudgetExceeded('token_budget')
         agent.model_settings.max_tokens = min(settings.AGENT_MAX_OUTPUT_TOKENS, remaining - input_estimate)
-        self.current_input=_public_checkpoint(input_items)
+        # Keep the exact public request protocol in memory for transient retry;
+        # persisted audit checkpoints below remain bounded independently.
+        self.current_input=_public_checkpoint(input_items, limit=None)
 
     async def on_llm_end(self, context, agent, response):
         usage=response.usage
@@ -346,7 +363,7 @@ class BudgetHooks(RunHooks):
         self.usage['cached_input_tokens'] += int(getattr(details, 'cached_tokens', 0) or 0)
         self.usage['cache_write_tokens'] += int(getattr(details, 'cache_write_tokens', 0) or 0)
         checkpoint=self.current_input+_public_checkpoint(response.output)
-        await self.ctx.save_checkpoint(checkpoint,self.usage)
+        await self.ctx.save_checkpoint(_public_checkpoint(checkpoint),self.usage)
         external_tokens=int((self.ctx.run.usage.get('external') or {}).get('total_tokens',0) or 0)
         if self.usage['total_tokens']+external_tokens>=self.max_tokens:
             raise AgentBudgetExceeded('token_budget')
@@ -399,6 +416,37 @@ def _input_text(text, breakpoint=False):
     return block
 
 
+def _continuation_input(error, hooks):
+    """Resume only a complete tool protocol, never repeat the initial plan.
+
+    At max-turn exhaustion the SDK exposes completed tool calls *and outputs*
+    in RunErrorDetails. A transient model failure happens before any new tool
+    action, so its pre-request input is the exact safe continuation point.
+    """
+    from agents.items import ItemHelpers
+    details = getattr(error, 'run_data', None)
+    if details is not None:
+        items = ItemHelpers.input_to_new_input_list(details.input)
+        items.extend(item.to_input_item() for item in details.new_items)
+        items = _public_checkpoint(items, limit=None)
+    else:
+        items = hooks.current_input
+    if not items:
+        return None
+    calls = {item.get('call_id') for item in items if item.get('type') == 'function_call'}
+    outputs = {item.get('call_id') for item in items if item.get('type') == 'function_call_output'}
+    if None in calls or calls != outputs:
+        # Never fabricate successful outputs or resume an incomplete call set.
+        return None
+    return items
+
+
+def _transient_model_error(error):
+    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+    return isinstance(error, (APIConnectionError, APITimeoutError, InternalServerError,
+                              RateLimitError, httpx.TransportError))
+
+
 async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
     """Run the real SDK; model injection supports deterministic offline integration tests."""
     if not isinstance(text,str) or not text.strip() or len(text)>12000:
@@ -412,8 +460,9 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
         if model is None:
             key,model_name,base=_credentials()
             cache_breakpoints = _supports_cache_breakpoints(base, model_name)
-            client=AsyncOpenAI(api_key=key,base_url=base,max_retries=0,
-                http_client=httpx.AsyncClient(timeout=httpx.Timeout(55,connect=10),follow_redirects=False,trust_env=False))
+            client=AsyncOpenAI(api_key=key,base_url=base,max_retries=settings.AGENT_MODEL_RETRIES,
+                http_client=httpx.AsyncClient(timeout=httpx.Timeout(settings.AGENT_MODEL_TIMEOUT_SECONDS,
+                    connect=min(10,settings.AGENT_MODEL_TIMEOUT_SECONDS)),follow_redirects=False,trust_env=False))
             model=OpenAIResponsesModel(model=model_name,openai_client=client)
         stage='agent.reference'
         live_reference = reference is None
@@ -458,10 +507,23 @@ async def run_cycle(ctx, text, *, model=None, tools=None, reference=None):
             group_id = f'family-assistant/{ctx.run.person_id}/{ctx.run.chat_id}'
         stage='agent.run'
         async with asyncio.timeout(settings.AGENT_TIMEOUT_SECONDS):
-            result=await Runner.run(agent,inputs,context=ctx,hooks=hooks,
-                max_turns=settings.AGENT_MAX_TURNS,
-                run_config=RunConfig(tracing_disabled=True,trace_include_sensitive_data=False,group_id=group_id,
-                    workflow_name='Family assistant',tool_execution=ToolExecutionConfig(max_function_tool_concurrency=1)))
+            continuations=0
+            while True:
+                try:
+                    result=await Runner.run(agent,inputs,context=ctx,hooks=hooks,
+                        max_turns=settings.AGENT_MAX_TURNS,
+                        run_config=RunConfig(tracing_disabled=True,trace_include_sensitive_data=False,group_id=group_id,
+                            workflow_name='Family assistant',tool_execution=ToolExecutionConfig(max_function_tool_concurrency=1)))
+                    break
+                except Exception as error:
+                    eligible=isinstance(error,MaxTurnsExceeded) or _transient_model_error(error)
+                    resumed=_continuation_input(error,hooks) if eligible else None
+                    if resumed is None or continuations>=settings.AGENT_MAX_CONTINUATIONS:
+                        raise
+                    continuations+=1
+                    hooks.usage['continuations']=continuations
+                    inputs=resumed
+                    await ctx.save_checkpoint(_public_checkpoint(inputs),hooks.usage)
         stage='agent.checkpoint'
         await ctx.save_checkpoint(_public_checkpoint(result.to_input_list()),hooks.usage)
         answer=str(result.final_output or '').strip()

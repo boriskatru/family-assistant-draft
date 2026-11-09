@@ -96,13 +96,25 @@ ERROR_ALERT_COOLDOWN_SECONDS = _positive_integer('ERROR_ALERT_COOLDOWN_SECONDS',
 AGENT_MAX_TOOL_CALLS = _positive_integer('AGENT_MAX_TOOL_CALLS', 24)
 AGENT_MAX_EXTERNAL_CALLS = _positive_integer('AGENT_MAX_EXTERNAL_CALLS', 8)
 AGENT_TIMEOUT_SECONDS = _positive_integer('AGENT_TIMEOUT_SECONDS', 180)
+AGENT_MODEL_TIMEOUT_SECONDS = _positive_integer('AGENT_MODEL_TIMEOUT_SECONDS', 90)
+
+def _nonnegative_integer(name, default):
+    try:
+        value = int(os.getenv(name, default))
+    except ValueError:
+        raise RuntimeError(f'{name} must be a nonnegative integer') from None
+    if value < 0:
+        raise RuntimeError(f'{name} must be a nonnegative integer')
+    return value
+
+AGENT_MODEL_RETRIES = _nonnegative_integer('AGENT_MODEL_RETRIES', 2)
+# A continuation shares the original timeout, token and tool-call budgets.
+AGENT_MAX_CONTINUATIONS = _nonnegative_integer('AGENT_MAX_CONTINUATIONS', 2)
 AGENT_MAX_OUTPUT_TOKENS = _positive_integer('AGENT_MAX_OUTPUT_TOKENS', 2000)
 AGENT_MAX_TOTAL_TOKENS = _positive_integer('AGENT_MAX_TOTAL_TOKENS', 80000)
 LLM_WEB_SEARCH_MAX_OUTPUT_TOKENS = _positive_integer('LLM_WEB_SEARCH_MAX_OUTPUT_TOKENS', 1800)
 LLM_STRUCTURED_MAX_OUTPUT_TOKENS = _positive_integer('LLM_STRUCTURED_MAX_OUTPUT_TOKENS', 4000)
 AGENT_HISTORY_USER_LIMIT = _positive_integer('AGENT_HISTORY_USER_LIMIT', 50)
-if AGENT_HISTORY_USER_LIMIT > 50:
-    raise RuntimeError('AGENT_HISTORY_USER_LIMIT must be between 1 and 50')
 # Empty disables the optional server-managed family profile. Missing/empty
 # files also leave the built-in instructions unchanged.
 PERSONAL_CONTEXT_FILE = os.getenv('PERSONAL_CONTEXT_FILE', str(BASE_DIR/'private'/'personal_context.md')).strip()

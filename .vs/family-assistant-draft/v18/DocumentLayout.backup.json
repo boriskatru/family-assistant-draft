@@ -7,12 +7,16 @@
       "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:.env.example||{8B382828-6202-11D1-8870-0000F87579D2}"
     },
     {
-      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py||{8B382828-6202-11D1-8870-0000F87579D2}",
-      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:assistant\\agent\\runner.py||{8B382828-6202-11D1-8870-0000F87579D2}"
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\boris\\source\\repos\\family-assistant-draft\\README.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}|MarkdownPreview",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:README.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}|MarkdownPreview"
     },
     {
       "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\boris\\source\\repos\\family-assistant-draft\\README.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}",
       "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:README.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py||{8B382828-6202-11D1-8870-0000F87579D2}",
+      "RelativeMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|solutionrelative:assistant\\agent\\runner.py||{8B382828-6202-11D1-8870-0000F87579D2}"
     },
     {
       "AbsoluteMoniker": "D:0:0:{A2FE74E1-B743-11D0-AE1A-00A0C90FFFC3}|\u003CMiscFiles\u003E|C:\\Users\\boris\\source\\repos\\family-assistant-draft\\manage.py||{8B382828-6202-11D1-8870-0000F87579D2}",
@@ -26,8 +30,24 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 0,
+          "SelectedChildIndex": 2,
           "Children": [
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{1c4feeaa-4718-4aa9-859d-94ce25d182ba}"
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "README.md [\u041F\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043B\u044C\u043D\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F]",
+              "DocumentMoniker": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\README.md",
+              "RelativeDocumentMoniker": "README.md",
+              "ToolTip": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\README.md [\u041F\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043B\u044C\u043D\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F]",
+              "RelativeToolTip": "README.md [\u041F\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043B\u044C\u043D\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F]",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-11-04T20:12:58.023Z",
+              "EditorCaption": " [\u041F\u0440\u0435\u0434\u0432\u0430\u0440\u0438\u0442\u0435\u043B\u044C\u043D\u0430\u044F \u0432\u0435\u0440\u0441\u0438\u044F]"
+            },
             {
               "$type": "Document",
               "DocumentIndex": 0,
@@ -36,22 +56,10 @@
               "RelativeDocumentMoniker": ".env.example",
               "ToolTip": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\.env.example",
               "RelativeToolTip": ".env.example",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAABAAAAAYAAAAAAAAAA==",
+              "ViewState": "AgIAAC0AAAAAAAAAAAAAABAAAAAYAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
               "WhenOpened": "2026-11-04T15:18:50.207Z",
               "EditorCaption": ""
-            },
-            {
-              "$type": "Document",
-              "DocumentIndex": 1,
-              "Title": "runner.py",
-              "DocumentMoniker": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py",
-              "RelativeDocumentMoniker": "assistant\\agent\\runner.py",
-              "ToolTip": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py",
-              "RelativeToolTip": "assistant\\agent\\runner.py",
-              "ViewState": "AgIAAAAAAAAAAAAAAAAAAGcBAAAqAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
-              "WhenOpened": "2026-11-04T12:07:22.744Z"
             },
             {
               "$type": "Document",
@@ -68,6 +76,19 @@
             {
               "$type": "Document",
               "DocumentIndex": 3,
+              "Title": "runner.py",
+              "DocumentMoniker": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py",
+              "RelativeDocumentMoniker": "assistant\\agent\\runner.py",
+              "ToolTip": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\assistant\\agent\\runner.py",
+              "RelativeToolTip": "assistant\\agent\\runner.py",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAGcBAAAqAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001001|",
+              "WhenOpened": "2026-11-04T12:07:22.744Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 4,
               "Title": "manage.py",
               "DocumentMoniker": "C:\\Users\\boris\\source\\repos\\family-assistant-draft\\manage.py",
               "RelativeDocumentMoniker": "manage.py",

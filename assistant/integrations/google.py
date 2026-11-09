@@ -26,7 +26,7 @@ from assistant.models import (
     OAuthState, Person, Reminder,
 )
 
-from assistant.reminder_defaults import event_reminder_minutes
+from assistant.reminder_defaults import event_reminder_minutes, event_reminder_due
 
 API = 'https://www.googleapis.com/calendar/v3'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
@@ -313,18 +313,26 @@ def _remote_fields(item, source, event=None):
         visibility = 'private' if item.get('visibility') == 'private' else 'shared'
     elif item.get('visibility') == 'private' and visibility != 'busy_only':
         visibility = 'private'
-    return {
+    result = {
         'title': (item.get('summary') or 'Без названия')[:300],
         'description': item.get('description', ''), 'location': item.get('location', '')[:500],
         'starts_at': starts, 'ends_at': ends, 'timezone': tz_name, 'end_timezone': end_tz,
         'all_day': all_day, 'start_date': start_date, 'end_date': end_date,
+        'blocks_time': item.get('transparency', 'opaque') != 'transparent',
         'status': 'confirmed', 'meeting_url': meeting, 'visibility': visibility,
     }
+    # Provider metadata may preserve a workload override, but it cannot grant
+    # visibility, bot access or membership in the family.
+    properties = item.get('extendedProperties', {}).get('private', {})
+    load = properties.get('family_assistant_counts_toward_load')
+    if load in ('true', 'false', 'auto'):
+        result['counts_toward_load'] = {'true': True, 'false': False, 'auto': None}[load]
+    return result
 
 
 def _snapshot(event):
     keys = ['title', 'description', 'location', 'starts_at', 'ends_at', 'timezone', 'end_timezone',
-            'all_day', 'start_date', 'end_date', 'status', 'meeting_url', 'visibility']
+            'all_day', 'start_date', 'end_date', 'blocks_time', 'counts_toward_load', 'status', 'meeting_url', 'visibility']
     result = {}
     for key in keys:
         value = getattr(event, key)
@@ -333,7 +341,22 @@ def _snapshot(event):
         elif isinstance(value, date):
             value = value.isoformat()
         result[key] = value
+    result['participants'] = sorted(str(pk) for pk in event.participants.values_list('pk', flat=True))
     return result
+
+
+def _baseline_snapshot(snapshot, event=None):
+    """Old saved baselines predate availability; migration kept them blocking.
+
+    Keep an empty recovery baseline empty: it means no sync was acknowledged.
+    Do not mutate persisted history merely to compare with the current schema.
+    """
+    if not snapshot:
+        return snapshot
+    baseline = {'blocks_time': True, 'counts_toward_load': None, **snapshot}
+    if 'participants' not in baseline and event is not None:
+        baseline['participants'] = sorted(str(pk) for pk in event.participants.values_list('pk', flat=True))
+    return baseline
 
 
 def _wire_snapshot(fields, event):
@@ -350,7 +373,12 @@ def _wire_snapshot(fields, event):
 def _export_payload(event):
     body = {'summary': event.title, 'description': event.description, 'location': event.location,
             'visibility': 'default' if event.visibility == 'shared' else 'private',
-            'extendedProperties': {'private': {'family_assistant_id': str(event.pk)}}}
+            'transparency': 'opaque' if event.blocks_time else 'transparent',
+            'extendedProperties': {'private': {
+                'family_assistant_id': str(event.pk),
+                'family_assistant_counts_toward_load': (
+                    'auto' if event.counts_toward_load is None else str(event.counts_toward_load).lower()),
+            }}}
     if event.all_day:
         if not event.start_date or not event.end_date:
             raise GoogleIntegrationError('Для события на весь день нужны начальная и конечная даты.')
@@ -362,6 +390,99 @@ def _export_payload(event):
     return body
 
 
+def _missing_shared_participants(binding, event, *, newly_shared=False):
+    """Repair only old Google-origin imports, never explicit app attendance.
+
+    A shared calendar declares family attendance for its provider-origin events.
+    Once initialized, the snapshot records participants, so a later explicit
+    local edit can remove someone without the next import adding them again.
+    """
+    if binding.source.role != 'shared' or event.visibility != 'shared':
+        return []
+    if not newly_shared and 'participants' in (binding.snapshot or {}):
+        return []
+    # App-created records already have deliberately selected attendance. Google
+    # IDs created by this adapter also cover conflict-resolution replacement IDs.
+    if binding.external_id.startswith('fa') and len(binding.external_id) == 34:
+        return []
+    existing = set(event.participants.values_list('pk', flat=True))
+    return list(Person.objects.filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).exclude(pk__in=existing))
+
+
+def _participant_reminders(event, added):
+    """Give new attendees future reminders without reviving disabled settings."""
+    if event.status != 'confirmed':
+        return
+    latest = {}
+    for reminder in event.reminders.filter(recipient_id=event.owner_id).order_by('-object_version', '-created_at'):
+        latest.setdefault((reminder.offset_minutes, reminder.kind), reminder)
+    configs = [(r.offset_minutes, r.kind) for r in latest.values()
+               if r.status not in ('disabled', 'cancelled')]
+    if not latest:
+        configs = [(event_reminder_minutes(event), 'reminder')]
+    now = timezone.now()
+    for person in added:
+        for offset, kind in configs:
+            due_at = event_reminder_due(event, offset, kind)
+            if due_at > now:
+                Reminder.objects.get_or_create(event=event, recipient=person,
+                    offset_minutes=offset, kind=kind, object_version=event.version,
+                    defaults={'due_at': due_at})
+
+
+def _repair_shared_participants(binding, event, *, new=False, newly_shared=False):
+    added = _missing_shared_participants(binding, event, newly_shared=newly_shared)
+    if not added:
+        return 0
+    before = _snapshot(event)
+    old_version = event.version
+    event.participants.add(*added)
+    if not new:
+        event.version += 1
+        event.save(update_fields=['version', 'updated_at'])
+    # This is a local attendance repair, not a pending remote content edit.
+    # Advance an acknowledged version only if no other edit is outstanding.
+    if binding.last_version == old_version:
+        binding.last_version = event.version
+    if binding.snapshot:
+        binding.snapshot = {**binding.snapshot,
+                            'participants': _snapshot(event)['participants']}
+        binding.save(update_fields=['snapshot', 'last_version', 'updated_at'])
+    _participant_reminders(event, added)
+    AuditLog.objects.create(actor=binding.source.connection.person,
+        action='google_participants_repair', target_type='event', target_id=event.pk,
+        before=before, after=_snapshot(event))
+    return len(added)
+
+
+def repair_shared_calendar_participants(*, apply=False, source=None):
+    """Offline, repeatable upgrade repair; default is a read-only count."""
+    bindings = CalendarBinding.objects.filter(source__role='shared', event__visibility='shared')
+    if source is not None:
+        bindings = bindings.filter(source=source)
+    result = {'events': 0, 'participants_added': 0}
+    for identifier in bindings.values_list('pk', flat=True).iterator():
+        with transaction.atomic():
+            binding = CalendarBinding.objects.select_related('source__connection__person').select_for_update().get(pk=identifier)
+            event = Event.objects.select_for_update().get(pk=binding.event_id)
+            missing = _missing_shared_participants(binding, event)
+            if not missing:
+                continue
+            result['events'] += 1
+            result['participants_added'] += len(missing)
+            if apply:
+                _repair_shared_participants(binding, event)
+    return result
+
+
+def _private_attendance(event):
+    """A provider privacy reduction must also remove private busy-time leaks."""
+    removed = event.participants.exclude(pk=event.owner_id)
+    event.reminders.filter(recipient_id__in=removed.values('pk'),
+                           status__in=['pending', 'queued', 'paused']).update(status='cancelled')
+    event.participants.set([event.owner_id])
+
+
 def _mark_conflict(binding, event, remote):
     binding.conflict = {'local': _snapshot(event), 'remote': remote}
     binding.save(update_fields=['conflict', 'updated_at'])
@@ -370,6 +491,7 @@ def _mark_conflict(binding, event, remote):
     if remote.get('visibility') == 'private' and event.visibility == 'shared':
         event.visibility = 'private'
         event.version += 1
+        _private_attendance(event)
     event.sync_status = 'conflict'
     event.save(update_fields=['sync_status', 'visibility', 'version', 'updated_at'])
     _notify(event.owner, f'Конфликт Google Calendar для события {event.id}. '
@@ -378,25 +500,10 @@ def _mark_conflict(binding, event, remote):
 
 
 def _refresh_reminders(event):
-    now = timezone.now()
-    # A delivered/missed reminder still describes a desired reminder offset.
-    # Use the newest record of each configuration so an explicitly cancelled
-    # reminder is not resurrected from older delivered history.
-    latest = {}
-    for reminder in event.reminders.order_by('-object_version', '-created_at'):
-        key = (reminder.recipient_id, reminder.offset_minutes, reminder.kind)
-        latest.setdefault(key, reminder)
-    event.reminders.filter(status__in=['pending', 'queued']).update(status='cancelled', updated_at=now)
-    if event.status != 'confirmed':
-        return
-    for reminder in latest.values():
-        if reminder.status not in ('pending', 'queued', 'sent', 'missed', 'summarized'):
-            continue
-        due_at = event.starts_at - timedelta(minutes=reminder.offset_minutes)
-        if due_at >= now:
-            Reminder.objects.get_or_create(event=event, recipient_id=reminder.recipient_id,
-                offset_minutes=reminder.offset_minutes, kind=reminder.kind,
-                object_version=event.version, defaults={'due_at': due_at})
+    # One policy for local edits and Google imports: metadata edits preserve
+    # delivered history, moved events get new schedules, explicit disables stay.
+    from assistant.reminder_actions import refresh_event_reminders
+    refresh_event_reminders(event, clone_pending=True)
 
 
 def _valid_source(event, source):
@@ -433,17 +540,20 @@ def _import_item(source, item):
             return
         if binding:
             event = Event.objects.select_for_update().get(pk=binding.event_id)
+            if item.get('visibility') != 'private':
+                _repair_shared_participants(binding, event)
             if binding.conflict:
                 return  # Explicit resolution is required, never auto-overwrite.
             fields = _remote_fields(item, source, event)
             remote = _wire_snapshot(fields, event)
             local = _snapshot(event)
-            remote_changed = item.get('etag', '') != binding.etag and remote != binding.snapshot
-            local_changed = event.version != binding.last_version and local != binding.snapshot
+            baseline = _baseline_snapshot(binding.snapshot, event)
+            remote_changed = item.get('etag', '') != binding.etag and remote != baseline
+            local_changed = event.version != binding.last_version and local != baseline
             if remote_changed and local_changed and remote != local and binding.last_version:
                 _mark_conflict(binding, event, remote)
                 return
-            if local_changed and remote == binding.snapshot:
+            if local_changed and (remote == baseline or item.get('etag', '') == binding.etag):
                 return  # Local edit awaits outbound synchronization.
             if remote_changed and remote != local:
                 before = local
@@ -457,6 +567,10 @@ def _import_item(source, item):
                 event.version += 1
                 event.sync_status = 'synced'
                 event.save()
+                if event.visibility == 'private' and source.role == 'shared':
+                    _private_attendance(event)
+                elif before['visibility'] == 'private' and event.visibility == 'shared':
+                    _repair_shared_participants(binding, event, new=True, newly_shared=True)
                 _refresh_reminders(event)
                 AuditLog.objects.create(actor=source.connection.person, action='google_import',
                     target_type='event', target_id=event.pk, before=before, after=_snapshot(event))
@@ -469,10 +583,12 @@ def _import_item(source, item):
                                          sync_status='synced', **fields)
             event.participants.add(source.connection.person)
             binding = CalendarBinding.objects.create(source=source, event=event, external_id=external_id)
-            if event.starts_at > timezone.now():
-                offset = event_reminder_minutes(event)
+            _repair_shared_participants(binding, event, new=True)
+            offset = event_reminder_minutes(event)
+            due_at = event_reminder_due(event, offset)
+            if due_at > timezone.now():
                 Reminder.objects.create(event=event, recipient=event.owner, offset_minutes=offset,
-                    due_at=event.starts_at.astimezone(dt_timezone.utc) - timedelta(minutes=offset), object_version=event.version)
+                    due_at=due_at, object_version=event.version)
         binding.etag = item.get('etag', '')
         binding.last_version = event.version
         binding.snapshot = _snapshot(event)
@@ -575,7 +691,7 @@ def sync_event(event_id, create_meet=False):
         if binding.snapshot.get('visibility') != 'shared':
             # A private Google-origin item may exist in a shared calendar. Keep
             # its local copy private, but do not delete or write it automatically.
-            if _snapshot(event) != binding.snapshot:
+            if _snapshot(event) != _baseline_snapshot(binding.snapshot, event):
                 Event.objects.filter(pk=event.pk).update(sync_status='error')
                 _notify(event.owner, f'Личное событие {event.id} находится в общем Google-календаре. '
                         'Изменение сохранено в боте; перенесите событие в личный календарь Google.',
@@ -602,8 +718,9 @@ def sync_event(event_id, create_meet=False):
         remote_fields = _remote_fields(remote, source, event)
         remote_snap = _wire_snapshot(remote_fields, event)
         if remote.get('etag') != binding.etag:
-            local_changed = _snapshot(event) != binding.snapshot
-            remote_changed = remote_snap != binding.snapshot
+            baseline = _baseline_snapshot(binding.snapshot, event)
+            local_changed = _snapshot(event) != baseline
+            remote_changed = remote_snap != baseline
             if local_changed and remote_changed and remote_snap != _snapshot(event):
                 _mark_conflict(binding, event, remote_snap)
                 return
@@ -635,7 +752,7 @@ def sync_event(event_id, create_meet=False):
         return
     body = _export_payload(event)
     conference = (remote or {}).get('conferenceData', {})
-    need_write = not remote or not binding or _snapshot(event) != binding.snapshot
+    need_write = not remote or not binding or _snapshot(event) != _baseline_snapshot(binding.snapshot, event)
     if create_meet and not event.meeting_url and not conference:
         _create_meet(body, event)
         need_write = True

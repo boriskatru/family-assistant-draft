@@ -3,7 +3,7 @@ import hashlib
 import io
 import re
 import uuid
-from datetime import UTC, datetime, timedelta, time
+from datetime import UTC, date, datetime, timedelta, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from django.conf import settings
@@ -17,7 +17,8 @@ from django.utils.text import get_valid_filename
 from .models import (Person,Project,Trip,Task,Event,Document,Checklist,ChecklistItem,Reminder,
                      ActionRequest,AuditLog,RecurrenceRule,OccurrenceOverride,TripSegment,Place,Contact)
 from .queue import enqueue
-from .reminder_defaults import event_reminder_minutes
+from .reminder_defaults import event_reminder_minutes, event_reminder_due
+from .event_timing import normalise_event_timing, TIMING_FIELDS
 from .place_links import prepare_segment_places
 
 ENTITY_MODELS={'project':Project,'trip':Trip,'task':Task,'event':Event,'document':Document,'checklist':Checklist,
@@ -47,10 +48,10 @@ def can_edit(obj,user):
     if user.telegram_id not in settings.ALLOWED_TELEGRAM_IDS: return False
     if obj.owner_id==user.id: return True
     if obj.visibility!='shared': return False
-    # Shared family events/trips belong to both spouses for editing purposes.
+    # Shared family events/trips/tasks belong to both spouses for editing purposes.
     # Resolve this at access time so existing records and checklists work too.
-    if isinstance(obj,(Event,Trip,Place,Contact)): return True
-    return obj.editors.filter(pk=user.pk).exists() or (isinstance(obj,Task) and obj.assignee_id==user.id)
+    if isinstance(obj,(Event,Trip,Task,Project,Place,Contact)): return True
+    return obj.editors.filter(pk=user.pk).exists()
 
 
 def get_entity(kind,identifier,user,shared_context=False):
@@ -171,7 +172,9 @@ def create_task(user,**data):
     priority=int(data.get('priority',2))
     if priority not in range(1,6): raise ValidationError('Приоритет: 1–5')
     links=_linked(data,user); links.pop('task_id',None)
-    obj=Task.objects.create(**base,**links,assignee=assigned,due_at=_dt(data.get('due_at'),user),priority=priority,estimated_minutes=minutes,remaining_minutes=minutes,allow_split=bool(data.get('allow_split',False)),category=str(data.get('category',''))[:64])
+    due_at,not_before=_dt(data.get('due_at'),user),_dt(data.get('not_before'),user)
+    if due_at and not_before and not_before>due_at:raise ValidationError('Начало выполнения не может быть позже срока.')
+    obj=Task.objects.create(**base,**links,assignee=assigned,due_at=due_at,not_before=not_before,priority=priority,estimated_minutes=minutes,remaining_minutes=minutes,allow_split=bool(data.get('allow_split',False)),category=str(data.get('category',''))[:64])
     obj.participants.set(list({p.id:p for p in people+[assigned]}.values()))
     deps=[get_entity('task',i,user) for i in data.get('dependencies',[])]
     obj.dependencies.set(deps)
@@ -197,18 +200,15 @@ def create_event(user,shared_context=False,**data):
     from .place_links import event_place_fields
     place_fields=event_place_fields(user,data,base['visibility'],shared_context)
     data={**data,**place_fields}
-    start=_dt(data.get('starts_at'),user,True,data.get('timezone')); end=_dt(data.get('ends_at'),user,True,data.get('end_timezone') or data.get('timezone'))
-    if end<=start: raise ValidationError('Конец должен быть позже начала')
+    timing=normalise_event_timing(user,data)
+    start=timing['starts_at']
     people=_people(data.get('participants'),user)
     if len(people) > 2:
         raise ValidationError('У события может быть не более двух участников.')
     if any(p.id!=user.id for p in people) and base['visibility']!='shared':
         raise ValidationError('Совместное событие должно быть общим')
     list(Person.objects.select_for_update().filter(pk__in=[p.id for p in people]).order_by('pk'))
-    tz=data.get('timezone',user.timezone); endtz=data.get('end_timezone',tz)
-    try: ZoneInfo(tz);ZoneInfo(endtz)
-    except Exception: raise ValidationError('Неизвестный часовой пояс IANA')
-    obj=Event.objects.create(**base,**_linked(data,user),starts_at=start,ends_at=end,timezone=tz,end_timezone=endtz,location=str(data.get('location',''))[:500],kind='call' if data.get('meeting') else data.get('kind','meeting'),flexible=bool(data.get('flexible',False)),buffer_before=max(0,int(data.get('buffer_before',0))),buffer_after=max(0,int(data.get('buffer_after',0))),meeting_url=data.get('meeting_url',''),all_day=bool(data.get('all_day',False)),start_date=data.get('start_date') or None,end_date=data.get('end_date') or None)
+    obj=Event.objects.create(**base,**_linked(data,user),**timing,counts_toward_load=data.get('counts_toward_load'),location=str(data.get('location',''))[:500],kind='call' if data.get('meeting') else data.get('kind','meeting'),flexible=bool(data.get('flexible',False)),buffer_before=max(0,int(data.get('buffer_before',0))),buffer_after=max(0,int(data.get('buffer_after',0))),meeting_url=data.get('meeting_url',''))
     if data.get('place_id'):
         obj.place_id=data['place_id'];obj.place_snapshot=data['place_snapshot']
         obj.save(update_fields=['place','place_snapshot'])
@@ -225,15 +225,15 @@ def create_event(user,shared_context=False,**data):
         _request(user, obj, {'status': 'confirmed'}, 'confirm_event')
     for person in people:
         for offset in sorted(set(minutes)):
-            Reminder.objects.create(event=obj, recipient=person, due_at=start.astimezone(UTC)-timedelta(minutes=offset),
+            Reminder.objects.create(event=obj, recipient=person, due_at=event_reminder_due(obj,offset,'custom' if offsets is not None else 'reminder'),
                                     kind='custom' if offsets is not None else 'reminder', offset_minutes=offset,
                                     object_version=obj.version, status='pending' if obj.status=='confirmed' else 'paused')
         if obj.status == 'confirmed' and person != user and person.chat_id:
-            local_start = start.astimezone(ZoneInfo(person.timezone))
+            from .event_display import event_span
             enqueue('telegram_send', {
                 'actor_id': str(person.pk), 'chat_id': person.chat_id,
                 'text': f'В вашем общем расписании появилось событие «{obj.title}».\n'
-                        f'{local_start:%d.%m.%Y %H:%M} ({person.timezone})\n'
+                        f'{event_span(obj,person.timezone)}\n'
                         f'Организатор — {user.name}.\n/show event {obj.pk}',
                 'permission_refs': [{'kind': 'event', 'id': str(obj.pk)}],
             }, f'joint-event:{obj.pk}:{person.pk}', queue='notifications')
@@ -243,26 +243,27 @@ def create_event(user,shared_context=False,**data):
     _audit(user,obj,'create');return obj
 
 
-def reschedule_event(event):
-    configs={}
-    for reminder in event.reminders.order_by('-object_version','-created_at'):
-        configs.setdefault((reminder.recipient_id,reminder.offset_minutes,reminder.kind),reminder)
-    # Google sync keeps delivery history. Rearm only the latest configuration.
-    event.reminders.exclude(pk__in=[r.pk for r in configs.values()]).filter(status__in=['pending','queued','paused']).update(status='cancelled')
-    for reminder in configs.values():
-        reminder.due_at=event.starts_at-timedelta(minutes=reminder.offset_minutes)
-        reminder.object_version=event.version
-        reminder.status='pending' if event.status=='confirmed' else ('cancelled' if event.status=='cancelled' else 'paused')
-        reminder.save()
+def reschedule_event(event, restore_cancelled=False):
+    from .reminder_actions import refresh_event_reminders
+    refresh_event_reminders(event, restore_cancelled=restore_cancelled)
     enqueue('google_event',{'event_id':str(event.id),'create_meet':event.kind=='call' and not event.meeting_url},f'google:{event.id}:v{event.version}')
 
 
 def _apply_event(user,event,changes):
+    old_status = event.status
     from .place_links import validate_event_place
-    allowed={'title','description','starts_at','ends_at','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot'}
+    allowed={'title','description','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot','participants','kind','counts_toward_load','reset_load_policy'} | TIMING_FIELDS
     if set(changes)-allowed: raise ValidationError('Недопустимые поля изменения')
+    changes=dict(changes)
+    if changes.pop('reset_load_policy',False):changes['counts_toward_load']=None
+    participants=changes.pop('participants',None)
+    before_participants=[str(p) for p in event.participants.values_list('pk',flat=True)]
+    if participants is not None:
+        from .editing import update_event_participants
+        participants=update_event_participants(user,event,participants,changes.get('visibility',event.visibility))
     validate_event_place(user,event,changes)
-    before={k:(getattr(event,k).isoformat() if isinstance(getattr(event,k),datetime) else str(getattr(event,k)) if isinstance(getattr(event,k),uuid.UUID) else getattr(event,k)) for k in changes}
+    changes={**changes,**normalise_event_timing(user,changes,event)}
+    before={k:(getattr(event,k).isoformat() if isinstance(getattr(event,k),date) else str(getattr(event,k)) if isinstance(getattr(event,k),uuid.UUID) else getattr(event,k)) for k in changes}
     for k,value in changes.items():
         if k in ('starts_at','ends_at'):value=_dt(value,user,True)
         if k=='visibility' and value not in ('private','shared','busy_only'):raise ValidationError('Некорректная видимость')
@@ -272,9 +273,12 @@ def _apply_event(user,event,changes):
     if event.visibility!='shared' and event.participants.exclude(pk=event.owner_id).exists():
         raise ValidationError('Сначала удалите других участников; совместная встреча должна оставаться общей')
     event.version+=1; event.full_clean();event.save()
+    if participants is not None:
+        before['participants']=before_participants
+        changes['participants']=participants
     if event.recurrence_id and event.occurrence_key:
-        OccurrenceOverride.objects.update_or_create(rule=event.recurrence,occurrence_key=event.occurrence_key,defaults={'action':'cancel' if event.status=='cancelled' else 'modify','changes':{k:v.isoformat() if isinstance(v,datetime) else v for k,v in changes.items()}})
-    reschedule_event(event);_audit(user,event,'update',before)
+        OccurrenceOverride.objects.update_or_create(rule=event.recurrence,occurrence_key=event.occurrence_key,defaults={'action':'cancel' if event.status=='cancelled' else 'modify','changes':{k:v.isoformat() if isinstance(v,date) else v for k,v in changes.items()}})
+    reschedule_event(event, restore_cancelled=old_status=='cancelled' and event.status=='confirmed');_audit(user,event,'update',before)
     return event
 
 
@@ -285,7 +289,7 @@ def update_event(user,event_id,changes,expected_version=None,shared_context=Fals
     if expected_version is not None and event.version!=expected_version:raise ValidationError('Запись уже изменилась, откройте её заново')
     if 'place_snapshot' in changes:raise ValidationError('Адрес выбирается по place_id, снимок формируется приложением.')
     from .place_links import event_place_fields,validate_event_place
-    safe_changes={k:v.isoformat() if isinstance(v,datetime) else str(v) if isinstance(v,uuid.UUID) else v for k,v in changes.items()}
+    safe_changes={k:v.isoformat() if isinstance(v,date) else str(v) if isinstance(v,uuid.UUID) else v for k,v in changes.items()}
     safe_changes.update(event_place_fields(user,changes,changes.get('visibility',event.visibility),shared_context))
     validate_event_place(user,event,safe_changes)
     # Both family members may edit shared events immediately. Creation of a
@@ -314,12 +318,16 @@ def approve_action(user,request_id,approve=True):
 
 @transaction.atomic
 def complete_task(user,task_id):
+    list(Person.objects.select_for_update().filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).order_by('pk'))
     task=Task.objects.select_for_update().get(pk=task_id)
     if not can_edit(task,user):raise PermissionDenied('Нет прав на завершение дела')
     if task.status=='done':return task
+    if task.status=='cancelled':raise ValidationError('Задача отменена; сначала верните её в работу, если она снова нужна.')
     if task.dependencies.exclude(status='done').exists():raise ValidationError('Сначала завершите зависимости')
     task.status='done';task.completed_at=timezone.now();task.remaining_minutes=0;task.version+=1;task.save()
-    task.reminders.update(status='cancelled')
+    task.reminders.exclude(status='disabled').update(status='cancelled')
+    from .planning_actions import cancel_task_reservations
+    task._cancelled_reservations=len(cancel_task_reservations(task,user,'task_completed'))
     from .recurrence import on_task_completed
     on_task_completed(task)
     _audit(user,task,'complete');return task
@@ -360,7 +368,7 @@ def safe_event(event,user,shared_context=False):
     readable=can_view(event,user,shared_context)
     if not readable and (shared_context or event.visibility!='busy_only'):return {}
     base={'id':str(event.id),'starts_at':event.starts_at.isoformat(),'ends_at':event.ends_at.isoformat(),'title':event.title if readable else 'Занят','status':event.status}
-    if readable:base.update(location=event.location,meeting_url=event.meeting_url,version=event.version,sync_status=event.sync_status,participants=[str(p.id) for p in event.participants.all()])
+    if readable:base.update(location=event.location,meeting_url=event.meeting_url,version=event.version,sync_status=event.sync_status,participants=[str(p.id) for p in event.participants.all()],all_day=event.all_day,start_date=event.start_date.isoformat() if event.start_date else None,end_date=event.end_date.isoformat() if event.end_date else None,blocks_time=event.blocks_time)
     return base
 
 
@@ -430,19 +438,12 @@ def share_entity(user,kind,identifier,visibility):
 
 @transaction.atomic
 def undo_task_completion(user,task_id):
+    list(Person.objects.select_for_update().filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS).order_by('pk'))
     task=Task.objects.select_for_update().get(pk=task_id)
     if not can_edit(task,user):raise PermissionDenied('Нет прав на изменение')
     if task.status!='done':return task
-    successor=Task.objects.filter(previous_task=task).first()
-    if successor and (successor.status not in ('todo','cancelled') or successor.version>1):
-        raise ValidationError('Следующая задача уже изменена. Разрешите конфликт вручную.')
-    if successor:
-        successor.status='cancelled';successor.save(update_fields=['status','updated_at'])
-        successor.reminders.update(status='cancelled')
-    task.status='todo';task.completed_at=None;task.remaining_minutes=task.estimated_minutes;task.version+=1;task.save()
-    for reminder in task.reminders.all():
-        reminder.object_version=task.version;reminder.status='pending';reminder.save()
-    _audit(user,task,'undo_complete');return task
+    from .task_actions import update_task
+    return update_task(user,task.pk,{'status':'todo'},task.version)
 
 
 def execute_action(user,action,shared_context=False):
@@ -460,8 +461,20 @@ def execute_action(user,action,shared_context=False):
         obj=update_event(user,args['event_id'],args.get('changes',{}),args.get('expected_version'),shared_context)
         if isinstance(obj,ActionRequest):return {'text':'Отправлено на согласование. До подтверждения событие не меняется.','request_id':str(obj.id)}
         return {'text':f'Событие обновлено: {obj.title}','entity_type':'event','entity_id':str(obj.id)}
+    if name=='update_task':
+        from .task_actions import update_task
+        obj=update_task(user,args['task_id'],args['changes'],args['expected_version'],shared_context)
+        return {'text':f'Дело {"отменено" if obj.status=="cancelled" else "обновлено"}: {obj.title}',
+                'entity_type':'task','entity_id':str(obj.pk),'status':obj.status,'version':obj.version,
+                'cancelled_reservations':getattr(obj,'_cancelled_reservations',0)}
+    if name=='convert_task_to_event':
+        from .task_actions import convert_task_to_event
+        obj=convert_task_to_event(user,args['task_id'],args['expected_version'],args['event'],shared_context)
+        return {'text':f'Создано событие «{obj.title}». Исходная ошибочная задача отменена.',
+                'entity_type':'event','entity_id':str(obj.pk),
+                'permission_refs':[{'kind':'task','id':str(args['task_id'])}]}
     if name=='complete_task':
-        obj=complete_task(user,args['task_id']);return {'text':f'Готово: {obj.title}','entity_type':'task','entity_id':str(obj.id)}
+        obj=complete_task(user,args['task_id']);return {'text':f'Готово: {obj.title}','entity_type':'task','entity_id':str(obj.id),'cancelled_reservations':getattr(obj,'_cancelled_reservations',0)}
     if name=='make_checklist':
         if shared_context:get_entity(args['parent_type'],args['parent_id'],user,True)
         obj=make_checklist(user,args['parent_type'],args['parent_id'],args['text']);return {'text':'Чек-лист сохранён','entity_type':'checklist','entity_id':str(obj.id)}
@@ -473,9 +486,11 @@ def execute_action(user,action,shared_context=False):
             day=parse_date(args.get('day','')) if args.get('day') else timezone.now().astimezone(ZoneInfo(user.timezone)).date()
             if not day:raise ValidationError('Некорректная дата')
             begin=datetime.combine(day,time.min,tzinfo=ZoneInfo(user.timezone));end=datetime.combine(day+timedelta(days=1),time.min,tzinfo=ZoneInfo(user.timezone))
-            qs=qs.filter(starts_at__lt=end,ends_at__gt=begin).exclude(status='cancelled').order_by('starts_at')
+            from .event_queries import event_overlap
+            qs=qs.filter(event_overlap(begin,end,user.timezone)).exclude(status='cancelled').order_by('starts_at')
             objects=list(qs[:50])
-            lines=[f"{e.starts_at.astimezone(ZoneInfo(user.timezone)):%d.%m %H:%M} — {safe_event(e,user,shared_context)['title']}\n{e.id}" for e in objects]
+            from .event_display import event_span
+            lines=[f"{event_span(e,user.timezone)} — {safe_event(e,user,shared_context)['title']}\n{e.id}" for e in objects]
         else:
             objects=list(qs.order_by('-created_at')[:50])
             lines=[f'{o.title}\n{o.id}' for o in objects]

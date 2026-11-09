@@ -70,10 +70,19 @@ def _intersection(left, right):
 
 
 def attending_events(person, start, end):
-    """Ownership is a fallback only for legacy events without participant rows."""
-    return Event.objects.filter(status='confirmed', starts_at__lt=end, ends_at__gt=start).filter(
+    """Date-only entries belong to local dates; timed entries overlap UTC time."""
+    from .event_queries import event_overlap
+    # Ownership is a fallback only for legacy events without participant rows.
+    return Event.objects.filter(event_overlap(start, end, person.timezone), status='confirmed').filter(
         Q(participants=person) | Q(owner=person, participants__isnull=True)
     ).distinct()
+
+
+def _event_bounds(event, person):
+    if event.all_day and event.start_date and event.end_date:
+        zone = ZoneInfo(person.timezone)
+        return _at(event.start_date, time.min, zone), _at(event.end_date, time.min, zone)
+    return event.starts_at, event.ends_at
 
 
 def _base_windows(person, day, domain='personal'):
@@ -104,8 +113,9 @@ def _base_windows(person, day, domain='personal'):
 
 def _busy(person, start, end):
     # Read only blocking times for other people's private events; never copy details.
-    events = list(attending_events(person, start - timedelta(days=1), end + timedelta(days=1)))
-    intervals = [(e.starts_at - timedelta(minutes=e.buffer_before), e.ends_at + timedelta(minutes=e.buffer_after)) for e in events]
+    events = list(attending_events(person, start - timedelta(days=1), end + timedelta(days=1)).filter(blocks_time=True))
+    intervals = [(begin - timedelta(minutes=e.buffer_before), finish + timedelta(minutes=e.buffer_after))
+                 for e in events for begin, finish in [_event_bounds(e, person)]]
     return intervals, events
 
 
@@ -125,11 +135,33 @@ def _participants(task):
     return list(persons.values())
 
 
+def _counts_toward_load(event):
+    """Time occupancy and daily workload are independent constraints.
+
+    A journey or hotel stay reserves time, but is not hours of work. An explicit
+    flag wins over the default so a working journey can still count if requested.
+    """
+    if event.counts_toward_load is not None:
+        return event.counts_toward_load
+    if not event.blocks_time:
+        return False
+    if event.kind in {'travel', 'transport', 'flight', 'train', 'bus', 'drive',
+                      'transfer', 'stay', 'hotel', 'vacation', 'holiday'}:
+        return False
+    segment = getattr(event, 'segment', None)
+    return segment is None or segment.kind not in {
+        'transport', 'flight', 'train', 'car', 'bus', 'walk', 'stay', 'hotel'}
+
+
 def _daily_load(person, day):
     zone = ZoneInfo(person.timezone)
     begin, end = _at(day, time.min, zone), _at(day + timedelta(days=1), time.min, zone)
-    return sum(_minutes(max(e.starts_at, begin), min(e.ends_at, end))
-               for e in attending_events(person, begin, end))
+    intervals = [(max(start, begin), min(finish, end))
+                 for event in attending_events(person, begin, end).select_related('segment')
+                 if _counts_toward_load(event)
+                 for start, finish in [_event_bounds(event, person)]]
+    # Overlapping appointments consume the same minutes, not duplicate workload.
+    return sum(_minutes(start, finish) for start, finish in _merge(intervals))
 
 
 def _split_local_days(windows, actors):
@@ -155,14 +187,28 @@ def _event_item(event, person):
     from .services import can_view
     details = can_view(event, person)
     # Even for a corrupt relation with a private participant, redact defensively.
+    start, end = _event_bounds(event, person)
     return {
         'kind': 'event', 'event_id': str(event.pk), 'version': event.version,
         'title': event.title if details else 'Занят',
-        'starts_at': event.starts_at.isoformat(), 'ends_at': event.ends_at.isoformat(),
+        'starts_at': start.isoformat(), 'ends_at': end.isoformat(),
+        'all_day': event.all_day, 'blocks_time': event.blocks_time,
+        'counts_toward_load': event.counts_toward_load,
+        'start_date': event.start_date.isoformat() if event.start_date else None,
+        'end_date': event.end_date.isoformat() if event.end_date else None,
         'state': 'confirmed', 'location': event.location if details else '',
         'meeting_url': event.meeting_url if details else '',
         'permission_mode': 'busy' if not details and event.visibility=='busy_only' else 'full',
     }
+
+
+def _unplaced_task(task, day_end, reason):
+    """A missing slot today is urgent only when the deadline is today or earlier."""
+    needs_attention = task.due_at is not None and task.due_at < day_end
+    return {'kind': 'unscheduled' if needs_attention else 'deferred',
+            'task_id': str(task.pk), 'title': task.title,
+            'state': 'problem' if needs_attention else 'deferred', 'reason': reason,
+            'due_at': task.due_at.isoformat() if task.due_at else None}
 
 
 @transaction.atomic
@@ -175,9 +221,9 @@ def build_daily_plan(person, day):
     end = _at(day + timedelta(days=1), time.min, zone)
     now = timezone.now()
     items = [_event_item(e, person) for e in attending_events(person, begin, end).order_by('starts_at')]
-    confirmed = list(attending_events(person, begin, end))
-    for previous, following in zip(sorted(confirmed, key=lambda e:e.starts_at), sorted(confirmed, key=lambda e:e.starts_at)[1:]):
-        if previous.ends_at + timedelta(minutes=previous.buffer_after + following.buffer_before) > following.starts_at:
+    confirmed = sorted(attending_events(person, begin, end).filter(blocks_time=True), key=lambda e:_event_bounds(e, person)[0])
+    for previous, following in zip(confirmed, confirmed[1:]):
+        if _event_bounds(previous, person)[1] + timedelta(minutes=previous.buffer_after + following.buffer_before) > _event_bounds(following, person)[0]:
             items.append({'kind':'problem', 'title':'Пересечение событий или недостаточный запас времени', 'state':'problem'})
 
     candidates = list(Task.objects.filter(status__in=['todo', 'in_progress']).filter(
@@ -192,6 +238,14 @@ def build_daily_plan(person, day):
     while unscheduled:
         progress = False
         for task in list(unscheduled):
+            if task.not_before and task.not_before >= end:
+                items.append({'kind': 'deferred', 'task_id': str(task.pk), 'title': task.title,
+                              'state': 'deferred', 'reason': 'Ещё не наступила дата начала задачи',
+                              'not_before': task.not_before.isoformat(),
+                              'due_at': task.due_at.isoformat() if task.due_at else None})
+                unscheduled.remove(task)
+                progress = True
+                continue
             dependencies = list(task.dependencies.all())
             if any(d.status != 'done' and str(d.pk) not in finishes for d in dependencies):
                 continue
@@ -211,10 +265,11 @@ def build_daily_plan(person, day):
                     cursor += timedelta(days=1)
                 windows = _intersection(windows, actor_windows)
             dependency_end = max((finishes[str(d.pk)] for d in dependencies if d.status != 'done'), default=begin)
-            windows = [(max(s, dependency_end), e) for s, e in windows if e > max(s, dependency_end)]
+            earliest = max(dependency_end, task.not_before or begin)
+            windows = [(max(s, earliest), e) for s, e in windows if e > max(s, earliest)]
             if task.due_at:
                 windows = [(s, min(e, task.due_at)) for s, e in windows if min(e, task.due_at) > s]
-            reservations = list(Event.objects.filter(task=task, status__in=['confirmed','proposed'], ends_at__gt=now))
+            reservations = list(Event.objects.filter(task=task, blocks_time=True, status__in=['confirmed','proposed'], ends_at__gt=now))
             booked = sum(_minutes(e.starts_at, e.ends_at) for e in reservations)
             awaiting_approval = any(e.status=='proposed' for e in reservations)
             if awaiting_approval:
@@ -261,7 +316,7 @@ def build_daily_plan(person, day):
                 reason = 'Недостаточно свободного времени или превышен дневной лимит'
                 if task.due_at and task.due_at <= now:
                     reason = 'Дедлайн уже прошёл; нужен новый срок'
-                items.append({'kind':'unscheduled','task_id':str(task.pk),'title':task.title,'state':'problem','reason':reason})
+                items.append(_unplaced_task(task, end, reason))
             else:
                 for start, stop in slots:
                     items.append({'kind':'task','task_id':str(task.pk),'task_version':task.version,'title':task.title,
@@ -272,14 +327,14 @@ def build_daily_plan(person, day):
                         key = str(actor.pk)
                         planned.setdefault(key, []).append((start, stop + timedelta(minutes=breaks)))
                 if left:
-                    items.append({'kind':'unscheduled','task_id':str(task.pk),'title':task.title,'state':'problem','reason':f'Осталось разместить {left} мин.'})
+                    items.append(_unplaced_task(task, end, f'Осталось разместить {left} мин.'))
                 elif not awaiting_approval:
                     finishes[str(task.pk)] = max([slots[-1][1]] + [e.ends_at for e in reservations])
             unscheduled.remove(task)
             progress = True
         if not progress:
             for task in unscheduled:
-                items.append({'kind':'unscheduled','task_id':str(task.pk),'title':task.title,'state':'problem','reason':'Предварительные задачи ещё не выполнены или не помещаются в план'})
+                items.append(_unplaced_task(task, end, 'Предварительные задачи ещё не выполнены или не помещаются в план'))
             break
     items.sort(key=lambda i:(i.get('starts_at', '9999'), i.get('title', '')))
     plan, created = DailyPlan.objects.get_or_create(person=person, day=day)
@@ -300,6 +355,7 @@ def daily_plan_message(person, day):
     confirmed = [i for i in plan.items if i['kind']=='event']
     proposed = [i for i in plan.items if i['kind']=='task']
     problems = [i for i in plan.items if i['kind'] in ['problem','unscheduled']]
+    deferred = [i for i in plan.items if i['kind']=='deferred']
     refs = {}
     def source(kind, identifier, mode=None):
         ref = {'kind':kind, 'id':str(identifier)}
@@ -310,7 +366,7 @@ def daily_plan_message(person, day):
             refs[key] = ref
     for item in confirmed:
         source('event', item['event_id'], item.get('permission_mode'))
-    for item in proposed + problems:
+    for item in proposed + problems + deferred:
         if item.get('task_id'):
             source('task', item['task_id'])
     for heading, group in [('События:',confirmed),('Предлагаемые дела:',proposed)]:
@@ -320,7 +376,17 @@ def daily_plan_message(person, day):
         for item in group:
             start = datetime.fromisoformat(item['starts_at']).astimezone(zone)
             end = datetime.fromisoformat(item['ends_at']).astimezone(zone)
-            text = f'• {start:%H:%M}–{end:%H:%M} {item["title"]}'
+            if item.get('all_day'):
+                first = date.fromisoformat(item['start_date']) if item.get('start_date') else start.date()
+                last = (date.fromisoformat(item['end_date']) if item.get('end_date') else end.date()) - timedelta(days=1)
+                period = 'Весь день' if item.get('blocks_time') else 'Без времени'
+                if last > first:
+                    period += f' ({first:%d.%m.%Y}–{last:%d.%m.%Y})'
+            elif start.date() == end.date() == plan.day:
+                period = f'{start:%H:%M}–{end:%H:%M}'
+            else:
+                period = f'{start:%d.%m.%Y %H:%M}–{end:%d.%m.%Y %H:%M}'
+            text = f'• {period} {item["title"]}'
             if item.get('location'):
                 text += f' · {item["location"]}'
             lines.append(text)
@@ -368,6 +434,8 @@ def daily_plan_message(person, day):
     if problems:
         lines.append('\nТребует внимания:')
         lines += ['• '+i['title']+(f': {i["reason"]}' if i.get('reason') else '') for i in problems]
+    if deferred:
+        lines.append(f'\nНа другие дни осталось задач: {len(deferred)} — с более поздним началом, сроком или без срока. Список: /tasks')
     if proposed:
         lines.append('\nДля принятия блоков: /accept YYYY-MM-DD')
     # Store the sources of this exact rendered snapshot. Re-querying visibility
@@ -433,18 +501,20 @@ def accept_plan(person, day):
         start, end = datetime.fromisoformat(item['starts_at']), datetime.fromisoformat(item['ends_at'])
         if start < timezone.now():
             raise ValidationError('Предложенное время уже прошло. Перестройте план.')
+        if task.not_before and start < task.not_before:
+            raise ValidationError('Дата начала задачи изменилась. Перестройте план.')
         if task.due_at and end > task.due_at:
             raise ValidationError('Дедлайн изменился. Перестройте план.')
         for dependency in task.dependencies.exclude(status='done'):
             finish = dependency_finishes.get(str(dependency.pk))
             if finish is None:
-                scheduled = list(Event.objects.filter(task=dependency, status='confirmed', ends_at__gt=timezone.now()))
+                scheduled = list(Event.objects.filter(task=dependency, blocks_time=True, status='confirmed', ends_at__gt=timezone.now()))
                 if sum(_minutes(e.starts_at,e.ends_at) for e in scheduled) >= dependency.remaining_minutes and scheduled:
                     finish = max(e.ends_at for e in scheduled)
             if finish is None or finish > start:
                 raise ValidationError('Изменились предварительные задачи. Перестройте план.')
         task_key = str(task.pk)
-        reservations = list(Event.objects.filter(task=task,status__in=['confirmed','proposed'],ends_at__gt=timezone.now()))
+        reservations = list(Event.objects.filter(task=task,blocks_time=True,status__in=['confirmed','proposed'],ends_at__gt=timezone.now()))
         booked = sum(_minutes(e.starts_at,e.ends_at) for e in reservations)
         proposed_minutes[task_key] = proposed_minutes.get(task_key,0) + _minutes(start,end)
         if booked + proposed_minutes[task_key] > task.remaining_minutes:

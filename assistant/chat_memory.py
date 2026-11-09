@@ -1,4 +1,4 @@
-"""Keep conversational turns per sender and Telegram chat, with their access guards."""
+"""Keep private dialogs and a shared, attributed family-chat history with ACL guards."""
 from collections import defaultdict
 import json
 from uuid import UUID
@@ -25,14 +25,15 @@ def remember_turn(person, chat_id, message_id, user_text, reply):
     # the unique (person, chat_id) constraint. Existing proposals are untouched.
     dialog, _ = Conversation.objects.select_for_update().get_or_create(person=person, chat_id=chat_id)
     turns = [entry for entry in dialog.messages if isinstance(entry, dict) and entry.get('role') == 'user']
-    turn = {'role': 'user', 'content': user_text, 'assistant': reply['text'], 'permission_refs': refs}
+    turn = {'role': 'user', 'content': user_text, 'assistant': reply['text'], 'permission_refs': refs,
+            'speaker_id': str(person.pk), 'speaker_name': person.name}
     if isinstance(message_id, int):
         turn['message_id'] = message_id
         turns = [entry for entry in turns if entry.get('message_id') != message_id]
     turns.append(turn)
     # Workers can finish in a different order from Telegram messages. Legacy
     # user-only entries have no message_id and predate all new-format entries.
-    turns.sort(key=lambda entry: entry.get('message_id', 0))
+    turns.sort(key=lambda entry: entry.get('message_id') if isinstance(entry.get('message_id'), int) else 0)
     dialog.messages = turns[-settings.AGENT_HISTORY_USER_LIMIT:]
     dialog.save(update_fields=['messages', 'updated_at'])
 
@@ -62,7 +63,22 @@ def read_chat_history(person, chat_id, shared, current_message_id=None, *, max_h
     prior_limit = settings.AGENT_HISTORY_USER_LIMIT - 1  # The new user message takes one slot.
     if prior_limit < 1 or chat_id != (settings.SHARED_CHAT_ID if shared else person.chat_id):
         return [], []
-    stored = Conversation.objects.filter(person=person, chat_id=chat_id).values_list('messages', flat=True).first() or []
+    if shared:
+        # Keep the existing per-person storage/locking, but read one chronological
+        # group conversation. Never import either spouse's private chat, and
+        # immediately exclude a person removed from the configured allowlist.
+        dialogs = Conversation.objects.filter(
+            chat_id=chat_id, person__telegram_id__in=settings.ALLOWED_TELEGRAM_IDS,
+        ).values('messages', 'person_id', 'person__name')
+        stored = []
+        for dialog in dialogs:
+            for entry in dialog['messages']:
+                if isinstance(entry, dict):
+                    stored.append({**entry, 'speaker_id': str(dialog['person_id']),
+                                   'speaker_name': dialog['person__name']})
+        stored.sort(key=lambda entry: entry.get('message_id') if isinstance(entry.get('message_id'), int) else 0)
+    else:
+        stored = Conversation.objects.filter(person=person, chat_id=chat_id).values_list('messages', flat=True).first() or []
     candidates = []
     for entry in stored:
         if not isinstance(entry, dict) or entry.get('role') != 'user':
@@ -112,7 +128,10 @@ def read_chat_history(person, chat_id, shared, current_message_id=None, *, max_h
     for entry, refs in reversed(pairs):
         if not all(readable(key) for key in refs):
             continue
-        exchange = [{'role': 'user', 'content': entry['content']}]
+        content = entry['content']
+        if shared:
+            content = f"{entry['speaker_name']} (user_id={entry['speaker_id']}):\n{content}"
+        exchange = [{'role': 'user', 'content': content}]
         if isinstance(entry.get('assistant'), str) and entry['assistant']:
             exchange.append({'role': 'assistant', 'content': entry['assistant']})
         if max_history_chars is not None:

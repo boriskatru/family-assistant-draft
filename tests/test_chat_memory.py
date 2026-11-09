@@ -97,7 +97,9 @@ def test_private_and_group_dialogs_are_separate_and_read_legacy_rows(people, set
     say(spouse, spouse.chat_id, 4, 'Приватный чат супруги', 'Её ответ')
     say(person, person.chat_id, 3, 'Личный диалог', 'ответ')
     say(person, person.chat_id, 4, '/google', 'https://accounts.example/private-state')
-    assert [m['content'] for m in read_chat_history(person, group, True)[0]] == ['Наш вопрос', 'Наш ответ']
+    assert [m['content'] for m in read_chat_history(person, group, True)[0]] == [
+        f'{person.name} (user_id={person.pk}):\nНаш вопрос', 'Наш ответ',
+        f'{spouse.name} (user_id={spouse.pk}):\nВопрос другого отправителя', 'Его ответ']
     assert [m['content'] for m in read_chat_history(person, person.chat_id, False)[0]] == [
         'старое сообщение', 'Личный диалог', 'ответ']
     assert read_chat_history(person, spouse.chat_id, False) == ([], [])

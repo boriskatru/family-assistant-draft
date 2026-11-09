@@ -1,5 +1,4 @@
 """Opt-in replacement of a single 15-minute reminder on existing calls/travel."""
-from datetime import timedelta
 from uuid import UUID
 
 from django.conf import settings
@@ -9,7 +8,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from assistant.models import Event, RecurrenceRule, Trip
-from assistant.reminder_defaults import default_event_reminder_minutes, event_reminder_minutes
+from assistant.reminder_defaults import default_event_reminder_minutes, event_reminder_minutes, event_reminder_due
 
 
 def _only_fifteens(rows, recipients):
@@ -47,7 +46,7 @@ class Command(BaseCommand):
                 if not _only_fifteens(rows, recipients):
                     continue
                 trip = template.get('trip_id')
-                offset = default_event_reminder_minutes(
+                offset = 0 if template.get('all_day') else default_event_reminder_minutes(
                     kind=template.get('kind', 'meeting'), title=template.get('title', ''),
                     location=template.get('location', ''), meeting_url=template.get('meeting_url', ''),
                     dated_trip=bool(trip and Trip.objects.filter(pk=trip, starts_on__isnull=False).exists()),
@@ -69,7 +68,7 @@ class Command(BaseCommand):
                 if event is None:
                     continue
                 offset = event_reminder_minutes(event)
-                due = event.starts_at - timedelta(minutes=offset)
+                due = event_reminder_due(event, offset)
                 if offset == 15 or due <= timezone.now():
                     continue
                 # Preserve history, queued deliveries, manual multi-offset schedules and exceptions.

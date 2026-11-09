@@ -114,13 +114,14 @@ def test_group_delivery_rechecks_source_access_and_rejects_unconfigured_destinat
     telegram.assert_not_called()
 
 
-def test_group_history_retains_own_private_sources_but_does_not_cross_senders_or_chats(people):
+def test_shared_group_history_keeps_private_source_acl_and_separate_private_chats(people):
     owner, spouse = people
     task = services.create_task(owner, title='Моя закрытая задача')
     guard = {'kind':'task', 'id':str(task.pk)}
     remember_turn(owner, GROUP, 1, 'Что у меня?', {'text':task.title,'permission_refs':[guard]})
     history, refs = read_chat_history(owner, GROUP, True)
-    assert [entry['content'] for entry in history] == ['Что у меня?', task.title]
+    assert [entry['content'] for entry in history] == [
+        f'{owner.name} (user_id={owner.pk}):\nЧто у меня?', task.title]
     assert refs == [guard]
     assert read_chat_history(spouse, GROUP, True) == ([], [])
     assert read_chat_history(owner, owner.chat_id, False) == ([], [])

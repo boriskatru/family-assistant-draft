@@ -128,6 +128,7 @@ def test_real_runner_observes_tool_results_and_chooses_next_action():
 
 def test_turn_limit_preserves_completed_action(settings):
     settings.AGENT_MAX_TURNS=1
+    settings.AGENT_MAX_CONTINUATIONS=0
     ctx=FakeContext()
     model=ScriptedModel([response(call('save_event',{'start':'2026-12-01T14:00:00+03:00'},'call-save'))])
     result=asyncio.run(run_cycle(ctx,'Создай встречу.',model=model,tools=basic_tools(),reference={}))
@@ -266,8 +267,10 @@ def test_context_tool_budget_propagates_out_of_sdk(people,settings):
     assert len(model.inputs)==2
 
 
-def test_current_generation_receives_reduced_output_budget(settings):
-    settings.AGENT_MAX_TOTAL_TOKENS=3000
+def test_current_generation_receives_reduced_output_budget(settings, monkeypatch):
+    # Exercise budget reduction independently of the changing product prompt.
+    monkeypatch.setattr('assistant.agent.runner.SYSTEM_INSTRUCTIONS', 'Ответь на вопрос пользователя.')
+    settings.AGENT_MAX_TOTAL_TOKENS=1000
     observed=[]
     class BudgetModel(ScriptedModel):
         async def get_response(self,*args,**kwargs):

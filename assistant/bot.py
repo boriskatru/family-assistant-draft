@@ -95,7 +95,7 @@ SETTINGS_HELP = """Настройки меняются в личном чате:
 
 WRITE_ACTIONS = {
     'create_project', 'create_trip', 'create_task', 'create_event', 'update_event',
-    'complete_task', 'make_checklist',
+    'complete_task', 'make_checklist', 'update_task', 'convert_task_to_event',
 }
 MODEL_BY_KIND = {'project': Project, 'task': Task, 'event': Event, 'trip': Trip, 'document': Document, 'checklist': Checklist}
 
@@ -219,7 +219,8 @@ def _listing(kind, person, shared):
     for obj in _visible_items(kind, person, shared):
         refs.append({'kind':kind,'id':str(obj.pk),**({'mode':'busy'} if kind=='event' and obj.visibility=='busy_only' and obj.owner_id!=person.pk else {})})
         if kind == 'event':
-            stamp = obj.starts_at.astimezone(ZoneInfo(person.timezone)).strftime('%d.%m %H:%M')
+            from .event_display import event_span
+            stamp = event_span(obj, person.timezone)
             if obj.owner_id != person.pk and obj.visibility == 'busy_only':
                 lines.append(f'{stamp} — Занят')
                 continue
@@ -273,8 +274,10 @@ def _card(kind, identifier, person, shared=False):
     if obj.description:
         lines.append(obj.description)
     if kind == 'event':
-        z = ZoneInfo(person.timezone)
-        lines.append(f'{obj.starts_at.astimezone(z):%d.%m.%Y %H:%M} — {obj.ends_at.astimezone(z):%d.%m.%Y %H:%M}')
+        from .event_display import event_span
+        lines.append(event_span(obj, person.timezone))
+        if not obj.blocks_time:
+            lines.append('Не занимает время в расписании.')
         if obj.location:
             lines.append(obj.location)
         if obj.meeting_url:
@@ -303,8 +306,10 @@ def _card(kind, identifier, person, shared=False):
                 lines.append('Распознанные сведения требуют проверки:\n'+json.dumps(review,ensure_ascii=False,indent=2)[:2500])
         rows.append([('Скачать оригинал',f'get:{obj.pk}')])
     if kind == 'task':
-        lines.append(f'Статус: {obj.status}; срок: {obj.due_at or "не задан"}')
-        rows.append([('Готово', f'done:{obj.pk}')])
+        due = obj.due_at.astimezone(ZoneInfo(person.timezone)).strftime('%d.%m.%Y %H:%M') if obj.due_at else 'не задан'
+        lines.append(f'Статус: {obj.status}; срок: {due}')
+        if obj.status not in ('cancelled', 'done'):
+            rows.append([('Готово', f'done:{obj.pk}')])
     if kind in {'task', 'trip', 'event'}:
         for document in services.visible(obj.documents.all(), person, shared_context=shared)[:5]:
             refs.append({'kind':'document','id':str(document.pk)})
@@ -356,6 +361,7 @@ def _settings(person, args, shared):
         else:
             raise ValueError(SETTINGS_HELP)
         person.profile = profile
+    person.version+=1
     person.full_clean()
     person.save()
     return _result('Настройки сохранены.')

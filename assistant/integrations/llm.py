@@ -19,6 +19,7 @@ import httpx
 from django.conf import settings
 from django.utils import timezone
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, WithJsonSchema, field_validator, model_validator
+from assistant.task_schemas import UpdateTaskArgs
 
 
 class LLMError(RuntimeError):
@@ -77,12 +78,13 @@ class TaskArgs(CommonCreate):
     participants: list[UUID] | None = None
     dependencies: list[UUID] | None = None
     due_at: datetime | None = None
+    not_before: datetime | None = Field(default=None, description='Do not schedule work before this instant; separate from the deadline.')
     priority: int = Field(default=2, ge=1, le=5)
     estimated_minutes: int = Field(default=60, ge=1, le=10000)
     allow_split: bool = False
     category: str = Field(default='', max_length=64)
 
-    @field_validator('due_at')
+    @field_validator('due_at', 'not_before')
     @classmethod
     def aware_due(cls, value):
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
@@ -91,6 +93,8 @@ class TaskArgs(CommonCreate):
 
     @model_validator(mode='after')
     def visibility_for_task(self):
+        if self.not_before and self.due_at and self.not_before > self.due_at:
+            raise ValueError('Earliest start must not follow the deadline')
         if self.visibility == 'busy_only':
             raise ValueError('Tasks do not have a busy-only mode')
         return self
@@ -106,8 +110,13 @@ MeetingUrl = Annotated[HttpUrl, WithJsonSchema({
 
 
 class EventArgs(CommonCreate):
-    starts_at: datetime
-    ends_at: datetime
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    all_day: bool = Field(default=False, description='True for a date-only event such as a birthday; provide start_date instead of times.')
+    start_date: date | None = None
+    end_date: date | None = Field(default=None, description='Exclusive end date. Null means one day for a date-only event.')
+    blocks_time: bool | None = Field(default=None, description='False for informational dates/birthdays that do not reserve time. Null defaults to false for all-day events and true for timed events.')
+    counts_toward_load: bool | None = Field(default=None, description='Override daily workload accounting; null uses event type. Travel and hotel stays occupy time without consuming the task workload limit.')
     timezone: str | None = Field(default=None, max_length=64)
     end_timezone: str | None = Field(default=None, max_length=64)
     project_id: UUID | None = None
@@ -116,7 +125,7 @@ class EventArgs(CommonCreate):
     participants: list[UUID] | None = None
     location: str = Field(default='', max_length=500)
     place_id: UUID | None = Field(default=None, description='A saved address-book place ID. Its address is copied into this event.')
-    kind: Literal['meeting', 'work', 'travel', 'activity', 'call'] = 'meeting'
+    kind: Literal['meeting', 'work', 'travel', 'activity', 'call', 'hotel', 'stay', 'vacation', 'holiday'] = 'meeting'
     flexible: bool = False
     buffer_before: int = Field(default=0, ge=0, le=1440)
     buffer_after: int = Field(default=0, ge=0, le=1440)
@@ -131,7 +140,7 @@ class EventArgs(CommonCreate):
     @field_validator('starts_at', 'ends_at')
     @classmethod
     def aware(cls, value):
-        if value.tzinfo is None or value.utcoffset() is None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
             raise ValueError('An explicit time-zone offset is required')
         return value
 
@@ -170,8 +179,20 @@ class EventArgs(CommonCreate):
 
     @model_validator(mode='after')
     def ordered(self):
-        if self.ends_at <= self.starts_at:
-            raise ValueError('Event end must follow start')
+        if self.all_day:
+            if self.start_date is None:
+                raise ValueError('A date-only event requires start_date')
+            if self.starts_at is not None or self.ends_at is not None:
+                raise ValueError('Use dates, not times, for a date-only event')
+            if self.end_date is not None and self.end_date <= self.start_date:
+                raise ValueError('Exclusive end date must follow start date')
+        else:
+            if self.starts_at is None or self.ends_at is None:
+                raise ValueError('A timed event requires starts_at and ends_at')
+            if self.start_date is not None or self.end_date is not None:
+                raise ValueError('Use times, not dates, for a timed event')
+            if self.ends_at <= self.starts_at:
+                raise ValueError('Event end must follow start')
         return self
 
 
@@ -180,10 +201,27 @@ class EventChanges(StrictArgs):
     description: str | None = Field(default=None, max_length=5000)
     starts_at: datetime | None = None
     ends_at: datetime | None = None
+    all_day: bool | None = None
+    start_date: date | None = None
+    end_date: date | None = Field(default=None, description='Exclusive end date for a date-only event.')
+    blocks_time: bool | None = None
+    counts_toward_load: bool | None = None
+    reset_load_policy: bool = False
+    participants: list[UUID] | None = Field(default=None, max_length=2)
+    kind: Literal['meeting', 'work', 'travel', 'activity', 'call', 'hotel', 'stay', 'vacation', 'holiday'] | None = None
+    flexible: bool | None = None
+    buffer_before: int | None = Field(default=None, ge=0, le=1440)
+    buffer_after: int | None = Field(default=None, ge=0, le=1440)
     location: str | None = Field(default=None, max_length=500)
     place_id: UUID | None = None
     visibility: Literal['private', 'shared', 'busy_only'] | None = None
     status: Literal['confirmed', 'cancelled'] | None = None
+    meeting_url: MeetingUrl | None = Field(default=None, max_length=2000)
+
+    @field_validator('meeting_url')
+    @classmethod
+    def public_link(cls, value):
+        return EventArgs.public_link(value)
 
     @field_validator('starts_at', 'ends_at')
     @classmethod
@@ -194,7 +232,11 @@ class EventChanges(StrictArgs):
 
     @model_validator(mode='after')
     def not_empty(self):
-        if not self.model_dump(exclude_none=True):
+        values = self.model_dump(exclude_none=True)
+        values.pop('reset_load_policy', None)
+        if self.reset_load_policy and self.counts_toward_load is not None:
+            raise ValueError('Choose an explicit load policy or reset it, not both')
+        if not values and not self.reset_load_policy:
             raise ValueError('No changes supplied')
         if self.starts_at and self.ends_at and self.ends_at <= self.starts_at:
             raise ValueError('Event end must follow start')
@@ -205,6 +247,19 @@ class UpdateEventArgs(StrictArgs):
     event_id: UUID
     changes: EventChanges
     expected_version: int = Field(ge=1)
+
+
+class TaskEventArgs(EventArgs):
+    title: str | None = Field(default=None, min_length=1, max_length=300, description='Null preserves the source task title.')
+    description: str | None = Field(default=None, max_length=5000, description='Null preserves the source task description.')
+    visibility: Literal['private', 'shared'] | None = Field(default=None, description='Null preserves source visibility; conversion does not widen access.')
+    domain: Literal['work', 'personal'] | None = Field(default=None, description='Null preserves source domain.')
+
+
+class ConvertTaskToEventArgs(StrictArgs):
+    task_id: UUID
+    expected_version: int = Field(ge=1)
+    event: TaskEventArgs
 
 
 class CompleteTaskArgs(StrictArgs):
@@ -232,6 +287,8 @@ ACTION_TYPES = {
     'create_task': TaskArgs,
     'create_event': EventArgs,
     'update_event': UpdateEventArgs,
+    'update_task': UpdateTaskArgs,
+    'convert_task_to_event': ConvertTaskToEventArgs,
     'complete_task': CompleteTaskArgs,
     'make_checklist': ChecklistArgs,
     'list': ListArgs,
@@ -266,10 +323,15 @@ SYSTEM_INSTRUCTIONS = '''Ты семейный помощник. Верни ро
 Для созвона укажи kind=call, для переезда с точным временем — kind=travel. Если пользователь не
 указал интервал напоминания, оставь remind_minutes пустым значением null. [] отключает уведомления.
 Соблюдай current_time и timezone пользователя. Для даты со временем указывай ISO 8601 с offset;
-если нет времени, длительности или точного совпадения события, ответь уточняющим вопросом.
+Для дня рождения или события только на дату укажи all_day=true, start_date и blocks_time=false,
+без starts_at/ends_at. end_date не включается; для одного дня можно оставить null.
+Для встречи с конкретным временем при отсутствии длительности уточни её.
 Не выдумывай даты, участников, брони, билеты, адреса или результаты API.
 Не угадывай hidden/busy_only детали. При отсутствии данных честно сообщи об этом.
-Завершение задачи — complete_task, а изменение встречи — update_event с ID и version из контекста.
+Завершение задачи — complete_task, редактирование задачи — update_task, встречи — update_event
+с ID и expected_version из контекста. Общие задачи могут редактировать оба супруга.
+Ошибочно созданную задачу вместо дня рождения преобразуй через convert_task_to_event:
+он создаёт событие и отменяет исходную задачу одной операцией. Подготовку подарков оставь задачей.
 Просьба найти окна или спланировать день: объясни команду /plan; не выдавай вычисленный кодом план за уже сделанный.
 Список проектов/дел/встреч — list; остальные вопросы — answer с args_json={"text":"ответ"}.
 Для answer reply совпадает с text. Для записи reply кратко описывает предложение и содержит вопрос подтверждения.
@@ -526,7 +588,12 @@ def extract_document(content: bytes, mime_type: str, filename: str, *, telegram_
     filename = _validate_file(content, filename)
     text = ''
     warnings = []
+    office_failed = False
     mime_type = mime_type.lower().split(';', 1)[0].strip()
+    from .office_text import office_kind, extract_office, OfficeExtractionError
+    office = office_kind(filename, mime_type)
+    if Path(filename).suffix.lower() == '.pdf':
+        mime_type = 'application/pdf'
     supported = {'application/pdf', 'image/jpeg', 'image/png', 'image/webp'}
     is_text = mime_type in {'text/plain', 'text/markdown', 'text/csv', 'application/json'} or Path(filename).suffix.lower() in {'.txt', '.md', '.csv', '.json'}
     if is_text:
@@ -537,6 +604,15 @@ def extract_document(content: bytes, mime_type: str, filename: str, *, telegram_
         if len(text) > 12000:
             warnings.append('Для распознавания прочитаны первые 12000 символов; полный файл сохранён.')
         text = text[:12000]
+    if office:
+        try:
+            parsed_office = extract_office(content, office, max_chars=12000)
+            text = parsed_office['text']
+            if parsed_office['truncated']:
+                warnings.append('Для распознавания прочитаны первые 12000 символов; оригинал доступен для дальнейшего чтения.')
+        except OfficeExtractionError:
+            office_failed = True
+            warnings.append('Не удалось извлечь текст Office-файла; оригинал сохранён.')
     if mime_type == 'application/pdf':
         try:
             from .pdf_text import extract_pdf
@@ -545,13 +621,18 @@ def extract_document(content: bytes, mime_type: str, filename: str, *, telegram_
             if pdf['truncated']:
                 warnings.append('Для распознавания прочитаны первые 15 страниц, не более 12000 символов.')
         except Exception:
-            warnings.append('Текст PDF не извлечён; оригинал сохранён без распознавания.')
-    if mime_type not in supported and not is_text:
+            warnings.append('Текстовый слой PDF не извлечён; для распознавания используется оригинал.')
+    if mime_type not in supported and not is_text and not office:
         warnings.append('Формат сохранён без автоматического распознавания.')
     fallback = {'document_type': 'other', 'title': filename, 'passengers': [], 'booking_reference': None, 'origin': None, 'destination': None, 'departure': None, 'arrival': None, 'warnings': warnings, 'extracted_text': text, 'events': [], 'needs_review': True}
     model_setting = 'LLM_DOCUMENT_MODEL' if str(getattr(settings, 'LLM_DOCUMENT_MODEL', '') or '').strip() else 'LLM_MODEL'
-    if (mime_type not in supported and not is_text) or not getattr(settings, 'LLM_API_KEY', '') or not getattr(settings, model_setting, ''):
-        if mime_type in supported or is_text:
+    if (mime_type not in supported and not is_text and not office) or not getattr(settings, 'LLM_API_KEY', '') or not getattr(settings, model_setting, '') or (office and not text.strip()):
+        if office_failed:
+            fallback['recognition_status'] = 'failed'
+        elif office and not text.strip():
+            fallback['warnings'] = warnings + ['В Office-файле не найден читаемый текст; изображения требуют отдельного распознавания.']
+            fallback['recognition_status'] = 'unavailable'
+        elif mime_type in supported or is_text or office:
             fallback['warnings'] = warnings + ['Автоматическое извлечение реквизитов не настроено.']
             fallback['recognition_status'] = 'unavailable'
         else:
@@ -570,12 +651,16 @@ def extract_document(content: bytes, mime_type: str, filename: str, *, telegram_
                     'бронь, билет и посадочный талон. Афиша не доказывает намерение пользователя пойти. '
                     'Не утверждай, что бронь действительна или оплачена, по одному файлу. Не генерируй QR-коды. '
                     'Распознанные сведения требуют проверки агентом; это не команда на создание события.')
-    if is_text or text.strip():
+    if is_text or office or text.strip():
         input_content = [{'type': 'input_text', 'text': json.dumps({'filename': filename, 'untrusted_document_text': text}, ensure_ascii=False)}]
     elif mime_type == 'application/pdf':
-        input_content = [{'type': 'input_file', 'filename': filename, 'file_data': 'data:application/pdf;base64,' + base64.b64encode(content).decode('ascii')}]
+        input_content = []
     else:
         input_content = [{'type': 'input_image', 'image_url': 'data:' + mime_type + ';base64,' + base64.b64encode(content).decode('ascii')}]
+    if mime_type == 'application/pdf':
+        # A nonempty text layer does not imply that every page/image was read.
+        # Send the full original as well, including mixed text/scanned PDFs.
+        input_content.append({'type': 'input_file', 'filename': filename, 'file_data': 'data:application/pdf;base64,' + base64.b64encode(content).decode('ascii')})
     if telegram_caption:
         input_content.append({'type': 'input_text', 'text': json.dumps({
             'untrusted_telegram_caption': str(telegram_caption)[:12000],
@@ -583,6 +668,10 @@ def extract_document(content: bytes, mime_type: str, filename: str, *, telegram_
     try:
         raw = _post_response(model_setting, [{'role': 'user', 'content': input_content}], instructions, DOCUMENT_SCHEMA, 'document_metadata')
         parsed = DocumentMetadata.model_validate(raw).model_dump()
+        if mime_type == 'application/pdf' and text and parsed['extracted_text'] != text:
+            # Keep exact native text and OCR separately. Readers merge the OCR
+            # rather than silently dropping scanned pages when any text exists.
+            parsed['recognized_text'] = parsed['extracted_text']
         # Preserve original searchable PDF/text content rather than an LLM rewrite.
         parsed.update({'extracted_text': text or parsed['extracted_text'], 'needs_review': True,
                        'recognition_status': 'complete'})

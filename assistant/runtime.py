@@ -253,8 +253,13 @@ def handle_job(job):
                 or (reminder.event_id and timezone.now() >= obj.ends_at)):
             current.update(status='missed')
             return
-        local=(obj.starts_at if reminder.event_id else obj.due_at).astimezone(ZoneInfo(reminder.recipient.timezone))
-        text=f'Напоминание: {obj.title}\n{local:%d.%m %H:%M} ({reminder.recipient.timezone})'
+        if reminder.event_id and obj.all_day:
+            from .event_display import event_span
+            stamp=event_span(obj,reminder.recipient.timezone)
+        else:
+            local=(obj.starts_at if reminder.event_id else obj.due_at).astimezone(ZoneInfo(reminder.recipient.timezone))
+            stamp=f'{local:%d.%m %H:%M} ({reminder.recipient.timezone})'
+        text=f'Напоминание: {obj.title}\n{stamp}'
         buttons=[]
         if reminder.event_id:
             if obj.location:text+='\n'+obj.location

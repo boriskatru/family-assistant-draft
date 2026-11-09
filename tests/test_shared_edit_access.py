@@ -208,13 +208,14 @@ def test_spouse_links_own_document_without_expanding_document_access(people, tmp
         services.link_document(owner, doc.pk, kind, obj.pk)
 
 
-def test_shared_tasks_and_projects_keep_explicit_editor_rules(people):
+def test_shared_tasks_and_projects_are_editable_but_private_projects_remain_private(people):
     owner, spouse = people
-    for obj in (services.create_project(owner, title='Проект', visibility='shared'),
-                services.create_task(owner, title='Дело', visibility='shared')):
-        assert services.can_view(obj, spouse) and not services.can_edit(obj, spouse)
-        obj.editors.add(spouse)
-        assert services.can_edit(obj, spouse)
+    task = services.create_task(owner, title='Дело', visibility='shared')
+    assert services.can_view(task, spouse) and services.can_edit(task, spouse)
+    project = services.create_project(owner, title='Проект', visibility='shared')
+    assert services.can_view(project, spouse) and services.can_edit(project, spouse)
+    private = services.create_project(owner, title='Личный проект')
+    assert not services.can_view(private, spouse) and not services.can_edit(private, spouse)
 
 
 @pytest.mark.django_db(transaction=True)

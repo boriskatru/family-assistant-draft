@@ -1,7 +1,7 @@
 """Local-time recurrence expansion with stable occurrence identities."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from itertools import islice
 from zoneinfo import ZoneInfo
 
@@ -16,7 +16,7 @@ from django.utils import timezone
 from .models import (Checklist, ChecklistItem, Event, OccurrenceOverride, Person,
                      RecurrenceRule, Reminder, Task)
 
-from .reminder_defaults import event_reminder_minutes
+from .reminder_defaults import event_reminder_minutes, event_reminder_due, task_reminder_due
 
 UTC = dt_timezone.utc
 HORIZON_DAYS = 180
@@ -66,12 +66,12 @@ def _reminder_template(obj):
     for r in obj.reminders.order_by('-object_version','-created_at'):
         configs.setdefault((r.recipient_id,r.offset_minutes,r.kind),r)
     return [{'recipient_id':str(r.recipient_id),'offset_minutes':r.offset_minutes,'kind':r.kind}
-            for r in configs.values() if r.status!='cancelled']
+            for r in configs.values() if r.status not in ('cancelled','disabled','detached')]
 
 
 def _event_template(event):
     fields = ['title','description','domain','visibility','location','kind','flexible',
-              'buffer_before','buffer_after','timezone','end_timezone','packing_notes','place_snapshot']
+              'buffer_before','buffer_after','timezone','end_timezone','packing_notes','place_snapshot','blocks_time','counts_toward_load']
     result = {f:getattr(event,f) for f in fields}
     result.update(duration_minutes=int((event.ends_at-event.starts_at).total_seconds()//60),
                   participants=[str(p.pk) for p in event.participants.all()],
@@ -98,7 +98,9 @@ def _task_template(task):
                   trip_id=str(task.trip_id) if task.trip_id else None,
                   parent_id=str(task.parent_id) if task.parent_id else None,
                   dependencies=[str(d.pk) for d in task.dependencies.all()],
-                  reminders=_reminder_template(task))
+                  reminders=_reminder_template(task),
+                  reminders_disabled=task.reminders.filter(status='disabled').exists(),
+                  not_before_offset_seconds=int((task.due_at-task.not_before).total_seconds()) if task.due_at and task.not_before else None)
     return result
 
 
@@ -110,7 +112,7 @@ def create_rule_from_event(user, event, rrule='', mode='calendar', cycle=None):
         raise PermissionDenied('Нет прав на создание серии этого события.')
     if event.status != 'confirmed':
         raise ValidationError('Сначала подтвердите событие.')
-    if event.recurrence_id:
+    if event.recurrence_id and event.recurrence.active:
         raise ValidationError('Событие уже относится к серии.')
     attendees = set(event.participants.values_list('telegram_id', flat=True))
     if event.owner_id != user.pk or attendees - {user.telegram_id}:
@@ -146,9 +148,9 @@ def create_rule_from_event(user, event, rrule='', mode='calendar', cycle=None):
 def create_rule_from_task(user,task,mode='after_completion',interval=1,unit='month',rrule=''):
     from .services import can_edit
     task = Task.objects.select_for_update().get(pk=task.pk)
-    if not can_edit(task,user) or task.owner_id != user.pk:
-        raise PermissionDenied('Создать серию может владелец задачи.')
-    if task.recurrence_id:
+    if not can_edit(task,user):
+        raise PermissionDenied('Нет прав на создание серии этой задачи.')
+    if task.recurrence_id and task.recurrence.active:
         raise ValidationError('Задача уже относится к серии.')
     if mode not in ['after_completion','calendar']:
         raise ValidationError('Для задач доступны calendar и after_completion.')
@@ -156,9 +158,9 @@ def create_rule_from_task(user,task,mode='after_completion',interval=1,unit='mon
         raise ValidationError('Интервал: 1–365 day/week/month.')
     start = task.due_at or timezone.now()
     if mode=='calendar':
-        rrule = _checked_rrule(rrule,start.astimezone(ZoneInfo(user.timezone)))
-    rule = RecurrenceRule.objects.create(owner=user,title=task.title,visibility=task.visibility,domain=task.domain,
-                                         kind='task',mode=mode,dtstart=start,timezone=user.timezone,
+        rrule = _checked_rrule(rrule,start.astimezone(ZoneInfo(task.owner.timezone)))
+    rule = RecurrenceRule.objects.create(owner=task.owner,title=task.title,visibility=task.visibility,domain=task.domain,
+                                         kind='task',mode=mode,dtstart=start,timezone=task.owner.timezone,
                                          interval=interval,unit=unit,rrule=rrule,template=_task_template(task))
     task.recurrence=rule
     task.occurrence_key=occurrence_key(start) if mode=='calendar' else f'first:{task.pk}'
@@ -219,6 +221,8 @@ def _new_reminders(obj, template):
             recipients = obj.participants.values_list('pk', flat=True)
             templates = [{'recipient_id': str(pk), 'offset_minutes': offset} for pk in recipients]
         else:
+            if template.get('reminders_disabled'):
+                return
             templates = [{'recipient_id': str(obj.owner_id), 'offset_minutes': 15}]
     for data in templates:
         recipient=Person.objects.filter(pk=data.get('recipient_id')).first()
@@ -226,7 +230,7 @@ def _new_reminders(obj, template):
             continue
         offset=max(0,min(int(data.get('offset_minutes',15)),525600))
         Reminder.objects.create(**{'event' if isinstance(obj,Event) else 'task':obj},recipient=recipient,
-                                due_at=moment-timedelta(minutes=offset),offset_minutes=offset,
+                                due_at=event_reminder_due(obj,offset,data.get('kind','reminder')) if isinstance(obj,Event) else task_reminder_due(obj,offset,data.get('kind','reminder')),offset_minutes=offset,
                                 object_version=obj.version,kind=data.get('kind','reminder'),status='pending')
 
 
@@ -237,6 +241,8 @@ def _clone_task(rule,moment,key,previous_task=None):
                     recurrence=rule,occurrence_key=key,due_at=moment,status='todo')
     if previous_task:
         defaults['previous_task']=previous_task
+    if template.get('not_before_offset_seconds') is not None:
+        defaults['not_before'] = moment-timedelta(seconds=int(template['not_before_offset_seconds']))
     task=Task.objects.create(**defaults)
     task.participants.set(Person.objects.filter(pk__in=template.get('participants',[])))
     task.dependencies.set(Task.objects.filter(pk__in=template.get('dependencies',[])))
@@ -246,7 +252,7 @@ def _clone_task(rule,moment,key,previous_task=None):
 
 def _clone_event(rule,moment,key,override):
     template=rule.template
-    values={f:template[f] for f in ['title','description','domain','visibility','location','kind','flexible','buffer_before','buffer_after','timezone','end_timezone','packing_notes','project_id','task_id','trip_id','place_id','place_snapshot'] if f in template}
+    values={f:template[f] for f in ['title','description','domain','visibility','location','kind','flexible','buffer_before','buffer_after','timezone','end_timezone','packing_notes','project_id','task_id','trip_id','place_id','place_snapshot','blocks_time','counts_toward_load'] if f in template}
     zone=ZoneInfo(rule.timezone)
     values.update(owner=rule.owner,title=template.get('title',rule.title),recurrence=rule,occurrence_key=key,
                   starts_at=moment,ends_at=moment+timedelta(minutes=max(1,int(template.get('duration_minutes',60)))),
@@ -261,12 +267,15 @@ def _clone_event(rule,moment,key,override):
         for name,value in override.changes.items():
             if name in {'starts_at','ends_at'}:
                 values[name]=_datetime(value)
-            elif name in {'title','description','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot'}:
+            elif name in {'start_date','end_date'}:
+                values[name]=date.fromisoformat(value) if value is not None else None
+            elif name in {'title','description','location','status','visibility','flexible','meeting_url','buffer_before','buffer_after','place_id','place_snapshot','all_day','blocks_time','timezone','end_timezone'}:
                 values[name]=value
     if values['ends_at']<=values['starts_at']:
         raise ValidationError('Некорректная длительность повторения.')
     event=Event.objects.create(**values)
-    participants=list(Person.objects.filter(pk__in=template.get('participants',[]))) or [rule.owner]
+    participant_ids = override.changes.get('participants', template.get('participants', [])) if override else template.get('participants', [])
+    participants=list(Person.objects.filter(pk__in=participant_ids, telegram_id__in=settings.ALLOWED_TELEGRAM_IDS)) or [rule.owner]
     event.participants.set(participants)
     for data in template.get('checklists',[]):
         checklist=Checklist.objects.create(event=event,title=data.get('title','Что взять'),source_text=data.get('source_text',''))
@@ -336,11 +345,16 @@ def on_task_completed(task):
     existing=Task.objects.select_for_update().filter(previous_task=task).first()
     if existing:
         if existing.status=='cancelled':
+            old_version = existing.version
+            if existing.not_before and existing.due_at:
+                existing.not_before += moment-existing.due_at
             existing.status='todo';existing.due_at=moment;existing.completed_at=None
             existing.remaining_minutes=existing.estimated_minutes;existing.version+=1
             existing.save()
-            for reminder in existing.reminders.all():
-                reminder.due_at=moment-timedelta(minutes=reminder.offset_minutes)
+            for reminder in existing.reminders.exclude(status='disabled'):
+                reminder.due_at=task_reminder_due(existing,reminder.offset_minutes,reminder.kind)
                 reminder.status='pending';reminder.object_version=existing.version;reminder.save()
+            from .services import _audit
+            _audit(task.owner, existing, 'restore_successor', {'version': old_version})
         return existing
     return _clone_task(rule,moment,f'after:{task.pk}',previous_task=task)

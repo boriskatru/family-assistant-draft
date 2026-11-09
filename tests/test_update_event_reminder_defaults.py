@@ -1,6 +1,7 @@
 from datetime import timedelta
 from io import StringIO
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from django.core.management import call_command
 from django.utils import timezone
@@ -63,3 +64,22 @@ def test_retime_series_including_dates_materialized_before_and_after_conversion(
     for instance in Event.objects.filter(recurrence=rule):
         assert instance.reminders.get().offset_minutes == 60
     assert 'eligible=0' in run(True)
+
+
+def test_retime_legacy_all_day_reminders_keeps_morning_anchor(people):
+    owner, _ = people
+    day = (timezone.now().astimezone(ZoneInfo(owner.timezone)) + timedelta(days=3)).date()
+    first = services.create_event(owner, title='День рождения', all_day=True,
+                                  start_date=day.isoformat(), remind_minutes=[15])
+    first.reminders.update(kind='reminder')
+    rule = recurrence.create_rule_from_event(owner, first, 'FREQ=DAILY;COUNT=2')
+    assert rule.template['reminders'][0]['offset_minutes'] == 15
+    assert 'eligible=2 applied=2' in run(True, rule.pk)
+    rule.refresh_from_db()
+    assert rule.template['reminders'][0]['offset_minutes'] == 0
+    reminder = first.reminders.get()
+    assert reminder.offset_minutes == 0
+    assert reminder.due_at.astimezone(ZoneInfo(owner.timezone)).hour == 9
+    recurrence.materialize_recurrences(first.starts_at)
+    for instance in Event.objects.filter(recurrence=rule):
+        assert instance.reminders.get().due_at.astimezone(ZoneInfo(owner.timezone)).hour == 9

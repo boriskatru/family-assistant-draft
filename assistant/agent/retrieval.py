@@ -65,9 +65,10 @@ def _summary(kind, obj, user, shared=False):
         result['status'] = obj.status
     if kind == 'event':
         result.update(starts_at=_iso(obj.starts_at), ends_at=_iso(obj.ends_at), timezone=obj.timezone,
-                      location=obj.location, meeting_url=obj.meeting_url)
+                      location=obj.location, meeting_url=obj.meeting_url, all_day=obj.all_day,
+                      start_date=_iso(obj.start_date), end_date=_iso(obj.end_date), blocks_time=obj.blocks_time, counts_toward_load=obj.counts_toward_load)
     elif kind == 'task':
-        result.update(due_at=_iso(obj.due_at), priority=obj.priority,
+        result.update(due_at=_iso(obj.due_at), not_before=_iso(obj.not_before), priority=obj.priority,
                       estimated_minutes=obj.estimated_minutes, remaining_minutes=obj.remaining_minutes)
     elif kind in ('project', 'trip'):
         result.update(starts_on=_iso(obj.starts_on), ends_on=_iso(obj.ends_on))
@@ -118,10 +119,8 @@ def search_records(user, kind, query='', date_from=None, date_to=None, status=''
             raise ValidationError('Этот статус не поддерживается.')
         qs = qs.filter(status=status)
     if kind == 'event':
-        if start:
-            qs = qs.filter(ends_at__gt=start)
-        if end:
-            qs = qs.filter(starts_at__lt=end)
+        from assistant.event_queries import event_overlap
+        qs = qs.filter(event_overlap(start, end, user.timezone))
         qs = qs.order_by('starts_at', 'id')
     elif kind == 'task':
         if start:
@@ -176,12 +175,12 @@ def read_record(user, kind, record_id, shared_context=False):
             data['place_snapshot'] = obj.place_snapshot
         if hasattr(obj, 'participants'):
             data['participants'] = [{'id': str(p.pk), 'name': p.name} for p in obj.participants.filter(telegram_id__in=settings.ALLOWED_TELEGRAM_IDS)]
-        for parent_kind in ('project', 'trip', 'task'):
+        for parent_kind in ('project', 'trip', 'task', 'parent'):
             if getattr(obj, parent_kind + '_id', None):
                 parent = getattr(obj, parent_kind)
                 if can_view(parent, user, shared_context):
                     data[parent_kind] = {'id': str(parent.pk), 'title': parent.title}
-                    refs.append(_ref(parent_kind, parent, user, shared_context))
+                    refs.append(_ref('task' if parent_kind=='parent' else parent_kind, parent, user, shared_context))
         if kind == 'project':
             data['goal'] = obj.goal
         related = {}
@@ -193,7 +192,7 @@ def read_record(user, kind, record_id, shared_context=False):
         elif kind == 'document':
             related = {'task': obj.tasks.all(), 'event': obj.events.all(), 'trip': obj.trips.all()}
         elif kind == 'task':
-            related = {'task': obj.subtasks.all()}
+            related = {'task': obj.subtasks.all(), 'event': Event.objects.filter(task=obj)}
         if related:
             data['related'] = {}
             for related_kind, candidates in related.items():
@@ -203,6 +202,22 @@ def read_record(user, kind, record_id, shared_context=False):
                     'items': [_summary(related_kind, member, user, shared_context) for member in members],
                     'total': candidates.count(), 'truncated': candidates.count() > 20}
                 refs += [_ref(related_kind, member, user, shared_context) for member in members]
+        if kind in ('event', 'task'):
+            if obj.recurrence_id:
+                rule=obj.recurrence
+                data['recurrence']={'id':str(rule.pk),'version':rule.version,'active':rule.active,
+                    'mode':rule.mode,'rrule':rule.rrule,'cycle':rule.cycle,'interval':rule.interval,
+                    'unit':rule.unit,'dtstart':_iso(rule.dtstart),'until':_iso(rule.until),'timezone':rule.timezone}
+            else: data['recurrence']=None
+            latest={}
+            for reminder in obj.reminders.order_by('-object_version','-created_at','-id'):
+                key=(reminder.recipient_id,reminder.offset_minutes,reminder.kind)
+                if key not in latest:
+                    latest[key]={'id':str(reminder.pk),'recipient_id':str(reminder.recipient_id),
+                        'offset_minutes':reminder.offset_minutes,'kind':reminder.kind,
+                        'local_time':reminder.kind[3:] if reminder.kind.startswith('at:') else None,
+                        'due_at':_iso(reminder.due_at),'status':reminder.status}
+            data['reminders']=list(latest.values())[:100]
         if kind == 'task':
             data.update(assignee_id=str(obj.assignee_id), allow_split=obj.allow_split, category=obj.category)
             deps = list(visible(obj.dependencies.all(), user, shared_context)[:50])
@@ -217,7 +232,7 @@ def read_record(user, kind, record_id, shared_context=False):
             data['segments'] = []
             for segment in obj.segments.select_related('event').order_by('position')[:100]:
                 if can_view(segment.event, user, shared_context):
-                    data['segments'].append({'id': str(segment.pk), 'event': _summary('event', segment.event, user, shared_context),
+                    data['segments'].append({'id': str(segment.pk), 'version': segment.version, 'position': segment.position, 'kind': segment.kind, 'event': _summary('event', segment.event, user, shared_context),
                                              'origin': segment.origin, 'destination': segment.destination,
                                              'origin_place_id': str(segment.origin_place_id) if segment.origin_place_id else None,
                                              'destination_place_id': str(segment.destination_place_id) if segment.destination_place_id else None,
@@ -228,7 +243,7 @@ def read_record(user, kind, record_id, shared_context=False):
                                              'transfer_minutes': segment.transfer_minutes})
                     refs.append(_ref('event', segment.event, user, shared_context))
         if kind in ('event', 'trip'):
-            data['checklists'] = [{'id': str(c.pk), 'title': c.title} for c in obj.checklists.all()[:20]]
+            data['checklists'] = [{'id': str(c.pk), 'title': c.title, 'version': c.version} for c in obj.checklists.all()[:20]]
             refs += [{'kind': 'checklist', 'id': c['id']} for c in data['checklists']]
         if kind in ('event', 'trip', 'task'):
             docs = list(visible(obj.documents.all(), user, shared_context)[:20])
@@ -257,8 +272,10 @@ def _document_text(doc):
     mime = doc.mime_type.lower().split(';', 1)[0]
     is_pdf = mime == 'application/pdf' or doc.original_name.lower().endswith('.pdf')
     is_text = mime in ('text/plain', 'text/markdown', 'text/csv', 'application/json') or Path(doc.original_name).suffix.lower() in ('.txt', '.md', '.csv', '.json')
+    from assistant.integrations.office_text import office_kind, extract_office
+    office = office_kind(doc.original_name, mime)
     truncated = False
-    if doc.file and (is_pdf or is_text):
+    if doc.file and (is_pdf or is_text or office):
         root = Path(settings.MEDIA_ROOT).resolve()
         try:
             path = Path(doc.file.path).resolve()
@@ -279,12 +296,18 @@ def _document_text(doc):
                     text = raw.decode('cp1251', errors='replace')
                 chunks = [(None, text[:MAX_DOCUMENT_CHARS])]
                 truncated = len(text) > MAX_DOCUMENT_CHARS
+            elif office:
+                parsed = extract_office(raw, office, max_chars=MAX_DOCUMENT_CHARS)
+                chunks = [(None, parsed['text'])]
+                truncated = parsed['truncated']
             else:
                 from assistant.integrations.pdf_text import extract_pdf
                 parsed = extract_pdf(raw, max_pages=MAX_DOCUMENT_PAGES,
                                      max_chars=MAX_DOCUMENT_CHARS, max_page_chars=MAX_PAGE_CHARS)
                 chunks = [(page['page'], page['text']) for page in parsed['pages']]
                 truncated = parsed['truncated']
+                if any(not page['text'].strip() for page in parsed['pages']):
+                    warnings.append('Часть страниц PDF не имеет текстового слоя; ниже добавлено сохранённое распознавание, если оно есть.')
         except (PermissionDenied, ValidationError):
             raise
         except Exception:
@@ -300,11 +323,20 @@ def _document_text(doc):
         truncated = truncated or len(stored) > MAX_DOCUMENT_CHARS
         if not stored.strip() and not doc.telegram_caption:
             warnings.append('Текст отсутствует. Для сканов и фотографий требуется распознавание документов.')
+    if is_pdf and isinstance(doc.metadata, dict):
+        recognized = doc.metadata.get('recognized_text', '')
+        # Older OCR records may only have extracted_text. Do not require a
+        # completely empty native PDF before making that text available.
+        if not isinstance(recognized, str) or not recognized.strip():
+            recognized = doc.metadata.get('extracted_text', '')
+        native = '\n'.join(t for _, t in chunks)
+        if isinstance(recognized, str) and recognized.strip() and recognized.strip() not in native:
+            chunks.append((None, 'Распознанный текст PDF (требует проверки):\n' + recognized[:MAX_DOCUMENT_CHARS]))
     if doc.telegram_caption:
         chunks.insert(0, (None, 'Подпись в Telegram:\n' + doc.telegram_caption))
     if isinstance(doc.metadata, dict):
         metadata = {key: value for key, value in doc.metadata.items()
-                    if key not in {'extracted_text', 'telegram_caption'} and value not in (None, '', [], {})}
+                    if key not in {'extracted_text', 'recognized_text', 'telegram_caption'} and value not in (None, '', [], {})}
         if metadata:
             remainder = MAX_DOCUMENT_CHARS - sum(len(value) + 2 for _, value in chunks)
             if remainder > 0:

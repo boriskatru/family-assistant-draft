@@ -60,6 +60,7 @@ def test_upgrade_preserves_legacy_events_segments_reminders_and_profile():
         assert upgraded.location == 'Исходный адрес события'
         assert set(upgraded.participants.values_list('pk', flat=True)) == {person.pk, spouse.pk}
         assert upgraded.place_id is None and upgraded.place_snapshot == {}
+        assert upgraded.blocks_time is True
         assert upgraded_segment.origin == 'Исходное отправление'
         assert upgraded_segment.destination == 'Исходное прибытие'
         assert upgraded_segment.origin_place_id is None and upgraded_segment.destination_place_id is None

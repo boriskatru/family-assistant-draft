@@ -27,6 +27,9 @@ def _day(value):
 
 
 def execute_operation(ctx,name,args):
+    from .editing_operations import EDIT_OPERATIONS, execute_edit_operation
+    if name in EDIT_OPERATIONS:
+        return execute_edit_operation(ctx,name,args)
     if name in ('save_place','save_contact'):
         from assistant import addressbook
         kind = 'place' if name == 'save_place' else 'contact'
@@ -65,7 +68,7 @@ def execute_operation(ctx,name,args):
             result['status']='awaiting_spouse_approval'
         elif result.get('entity_type')=='event':
             event=Event.objects.get(pk=result['entity_id'])
-            result['status']='awaiting_spouse_approval' if name=='create_event' and event.status=='proposed' else event.status
+            result['status']='awaiting_spouse_approval' if name in ('create_event','convert_task_to_event') and event.status=='proposed' else event.status
         result['permission_refs']=refs
         return result
 
